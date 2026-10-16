@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Preserve upstream license text verbatim, including its original whitespace.
+tools/licenses/** -text -whitespace

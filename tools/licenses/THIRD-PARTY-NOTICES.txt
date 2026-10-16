@@ -1,0 +1,33 @@
+AnimRef is distributed under the MIT License in the repository root. The following separately bundled tools retain their own licenses and notices.
+
+FFmpeg and ffprobe
+------------------
+Version: FFmpeg 9.0.2, Windows x64 Essentials Build by Gyan Doshi.
+License: GPL-3.0-or-later. This build enables --enable-gpl and --enable-version3.
+The verbatim license shipped in the Gyan archive is included as FFMPEG-LICENSE.txt.
+Binary builds: https://www.gyan.dev/ffmpeg/builds/
+Archive: https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip
+Archive SHA-256: 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+FFmpeg source revision: https://github.com/FFmpeg/FFmpeg/tree/946fcce07b
+FFmpeg legal information: https://ffmpeg.org/legal.html
+
+yt-dlp
+------
+Version: 2026.08.19, official standalone Windows x64 executable.
+yt-dlp itself is released under the Unlicense. The PyInstaller-bundled Windows executable includes GPLv3-or-later components; see the included YT-DLP-THIRD-PARTY-LICENSES.txt for the bundled component notices and license texts.
+The official project states that the PyInstaller executable is a GPLv3-or-later combined work. Its source and release files are available at the links below.
+Source: https://github.com/yt-dlp/yt-dlp/tree/2026.08.19
+Release: https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19
+Binary: https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe
+Official checksum manifest: https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/SHA2-256SUMS
+Binary SHA-256: 66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a
+The project's Unlicense text is included as YT-DLP-LICENSE.txt. Its official bundled dependency notices are included as YT-DLP-THIRD-PARTY-LICENSES.txt.
+
+Deno
+----
+Version: 2.9.7, official x86_64-pc-windows-msvc release binary.
+License: MIT; the license from the versioned source tree is included as DENO-LICENSE.md.
+Source: https://github.com/denoland/deno/tree/v2.9.7
+Release: https://github.com/denoland/deno/releases/tag/v2.9.7
+Binary: https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-pc-windows-msvc.zip
+The downloaded deno.exe has a valid Authenticode signature from Deno Land Inc. The Deno source tree contains notices for its third-party dependencies and their respective licenses.

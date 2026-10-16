@@ -1,0 +1,32 @@
+# Rust 迁移交付
+
+项目现为 Windows 原生 Rust/egui 应用。Luna 完成实现和环境配置，主代理负责原代码审计、实施指导、独立验收和最终提交。
+
+## 启动
+
+运行仓库下 `dist/AnimRef/AnimRef.exe`。完整分发包为 `dist/AnimRef-Windows.zip`，解压后保持 `tools` 和 `docs` 目录与 exe 相邻。Windows 10/11 x64 需要 Microsoft Visual C++ x64 运行库；当前机器已具备。
+
+## 功能与数据
+
+- 支持图片、GIF、文字、本地视频、远程图片，以及 YouTube 片段；视频保持原版静音参考播放方式。
+- 支持画布缩放、平移、选择、层级、拖动、等比调整尺寸、删除、视频编辑与区间循环。
+- 保留无边框置顶窗口及常用快捷键；快捷键详见根目录 Readme。
+- 可读取旧 `.purgif`，保留画布变换、元素顺序、中文/多行文字和循环区间。旧版编辑视频状态恢复为正常画布视图。
+- YouTube 先读取元数据，填写原视频起止时间，点击下载后请求该区间；原链接、原时长、区间和缓存路径写入场景。网络分片/关键帧可能带来少量相邻数据读取。
+- `.purgif` 不打包外部媒体。移动场景时需保留对应文件；换机器或清空缓存后，YouTube 片段可重新选择下载。
+
+旧 Electron/Node 运行文件、npm 清单/锁文件、旧展示素材和对应忽略规则已清理。`LICENSE` 和通用 Git 属性保留；媒体侧程序许可证在 `tools/licenses`。
+
+## 开发与验收
+
+```powershell
+./scripts/setup-windows.ps1
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+./scripts/package-windows.ps1
+```
+
+准确版本见 [环境记录](ENVIRONMENT.md)，测试结果、真实截图和覆盖范围见 [验收记录](ACCEPTANCE.md)。`target/acceptance` 中的合成场景、运行报告与诊断图片用于本机复验；生成物和 `dist` 均不纳入 Git。
+
+最终提交可通过 `git log -1 --oneline` 查看。本次只提交本地仓库，未推送远程。
