@@ -1,5 +1,10 @@
 AnimRef is distributed under the MIT License in the repository root. The following separately bundled tools retain their own licenses and notices.
 
+egui-phosphor and Phosphor Icons
+-------------------------------
+egui-phosphor 0.10.0, by amPerl, is licensed under MIT OR Apache-2.0. The selected Regular icon font artwork is from Phosphor Icons, licensed under MIT. License texts are included as EGUI-PHOSPHOR-LICENSE-MIT.txt, EGUI-PHOSPHOR-LICENSE-APACHE.txt, and PHOSPHOR-ICONS-LICENSE-MIT.txt.
+Sources: https://github.com/amPerl/egui-phosphor/tree/v0.10.0 and https://github.com/phosphor-icons/web
+
 FFmpeg and ffprobe
 ------------------
 Version: FFmpeg 9.0.2, Windows x64 Essentials Build by Gyan Doshi.

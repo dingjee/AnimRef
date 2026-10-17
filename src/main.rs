@@ -5,7 +5,7 @@ mod dialog_coordinator;
 mod icon;
 mod window_host;
 
-use animref::{asset_io, media, model, youtube};
+use animref::{asset_io, media, model, pinterest, youtube};
 use anyhow::{Context, Result};
 use app_action::AppAction;
 #[cfg(windows)]
@@ -82,6 +82,11 @@ enum UiScenario {
     Playback,
     Youtube,
     Grid,
+    ItemMenu,
+    WindowMenu,
+    RecentMenu,
+    Toast,
+    Resize,
 }
 
 impl CliOptions {
@@ -101,6 +106,11 @@ impl CliOptions {
                         "playback" => UiScenario::Playback,
                         "youtube" => UiScenario::Youtube,
                         "grid" => UiScenario::Grid,
+                        "item-menu" => UiScenario::ItemMenu,
+                        "window-menu" => UiScenario::WindowMenu,
+                        "recent-menu" => UiScenario::RecentMenu,
+                        "toast" => UiScenario::Toast,
+                        "resize" => UiScenario::Resize,
                         _ => UiScenario::Clean,
                     };
                 }
@@ -187,6 +197,7 @@ struct AnimRefApp {
     image_assets: HashMap<String, TextureHandle>,
     image_errors: HashMap<String, String>,
     remote_jobs: Vec<crossbeam_channel::Receiver<RemoteImageResult>>,
+    pinterest_jobs: Vec<(u64, pinterest::PinterestJob)>,
     remote_pending: HashSet<u64>,
     scene_generation: u64,
     cli: CliOptions,
@@ -205,6 +216,14 @@ struct AnimRefApp {
     dialogs: DialogCoordinator,
     toast: Option<(String, Instant)>,
     context_menu_pos: Option<Pos2>,
+    context_menu_item: bool,
+    context_submenu: Option<&'static str>,
+    context_submenu_anchor: Option<Rect>,
+    diagnostic_menu_rect: Option<Rect>,
+    diagnostic_transport_rect: Option<Rect>,
+    diagnostic_header_rect: Option<Rect>,
+    diagnostic_toast_rect: Option<Rect>,
+    resize_hovered: bool,
     hovered_header: bool,
     last_presented_position: HashMap<u64, f64>,
     animation_paused: HashMap<u64, bool>,
@@ -239,6 +258,7 @@ impl AnimRefApp {
             image_assets: HashMap::new(),
             image_errors: HashMap::new(),
             remote_jobs: Vec::new(),
+            pinterest_jobs: Vec::new(),
             remote_pending: HashSet::new(),
             scene_generation: 1,
             cli,
@@ -257,6 +277,14 @@ impl AnimRefApp {
             dialogs: DialogCoordinator::default(),
             toast: None,
             context_menu_pos: None,
+            context_menu_item: false,
+            context_submenu: None,
+            context_submenu_anchor: None,
+            diagnostic_menu_rect: None,
+            diagnostic_transport_rect: None,
+            diagnostic_header_rect: None,
+            diagnostic_toast_rect: None,
+            resize_hovered: false,
             hovered_header: false,
             last_presented_position: HashMap::new(),
             animation_paused: HashMap::new(),
@@ -298,6 +326,21 @@ impl AnimRefApp {
             UiScenario::Menu => app.context_menu_pos = Some(Pos2::new(24.0, 58.0)),
             UiScenario::Title => app.hovered_header = true,
             UiScenario::Grid => app.scene.grid.enabled = true,
+            UiScenario::ItemMenu => {
+                app.selected = app.scene.elements.len().checked_sub(1);
+                app.context_menu_pos = Some(Pos2::new(24.0, 58.0));
+                app.context_menu_item = true;
+            }
+            UiScenario::WindowMenu | UiScenario::RecentMenu => {
+                app.context_menu_pos = Some(Pos2::new(24.0, 58.0));
+                app.context_submenu = Some(if app.cli.ui_scenario == UiScenario::WindowMenu {
+                    "Window"
+                } else {
+                    "Recent"
+                });
+            }
+            UiScenario::Toast => app.status = "Changes saved successfully".into(),
+            UiScenario::Resize => app.selected = (!app.scene.elements.is_empty()).then_some(0),
             UiScenario::Playback => app.playback_scenario_pending = true,
             UiScenario::Clean => {}
         }
@@ -351,6 +394,7 @@ impl AnimRefApp {
 
     fn load_scene(&mut self, path: &Path) -> Result<()> {
         self.show_youtube = None;
+        self.cancel_pinterest_jobs();
         self.scene_generation = self.scene_generation.wrapping_add(1);
         let scene_path = if path.is_absolute() {
             path.to_owned()
@@ -439,6 +483,7 @@ impl AnimRefApp {
 
     fn new_scene(&mut self) {
         self.show_youtube = None;
+        self.cancel_pinterest_jobs();
         self.scene_generation = self.scene_generation.wrapping_add(1);
         self.scene = Scene::default();
         self.scene_path = None;
@@ -489,6 +534,22 @@ impl AnimRefApp {
         self.show_youtube = Some(dialog);
     }
 
+    fn start_pinterest_download(&mut self, url: String) {
+        match pinterest::begin_download(url) {
+            Ok(job) => {
+                self.pinterest_jobs.push((self.scene_generation, job));
+                self.status = "Downloading Pinterest Pin…".into();
+            }
+            Err(error) => self.status = format!("Could not import Pinterest Pin: {error}"),
+        }
+    }
+
+    fn cancel_pinterest_jobs(&mut self) {
+        for (_, job) in self.pinterest_jobs.drain(..) {
+            job.cancel();
+        }
+    }
+
     fn add_text(&mut self, text: String) {
         if text.trim().is_empty() {
             return;
@@ -518,6 +579,10 @@ impl AnimRefApp {
                 let text = text.trim().to_owned();
                 if is_youtube_url(&text) {
                     self.start_youtube_metadata(text, None);
+                    return;
+                }
+                if is_pinterest_pin_url(&text) {
+                    self.start_pinterest_download(text);
                     return;
                 }
                 if let Some(path) = clipboard_path(&text) {
@@ -701,6 +766,76 @@ impl AnimRefApp {
             }
         }
         self.remote_jobs = pending;
+    }
+
+    fn drain_pinterest_imports(&mut self) {
+        let mut pending = Vec::new();
+        let jobs = std::mem::take(&mut self.pinterest_jobs);
+        for (generation, job) in jobs {
+            loop {
+                match job.events.try_recv() {
+                    Ok(pinterest::PinterestEvent::Progress(message)) => {
+                        if generation == self.scene_generation {
+                            self.status = message;
+                        }
+                    }
+                    Ok(pinterest::PinterestEvent::Finished(media)) => {
+                        if generation == self.scene_generation {
+                            self.finish_pinterest_download(media);
+                        }
+                        break;
+                    }
+                    Ok(pinterest::PinterestEvent::Failed(error)) => {
+                        if generation == self.scene_generation {
+                            self.status = format!("Pinterest import failed: {error}");
+                        }
+                        break;
+                    }
+                    Ok(pinterest::PinterestEvent::Cancelled) => break,
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        pending.push((generation, job));
+                        break;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        if generation == self.scene_generation {
+                            self.status = "Pinterest download stopped unexpectedly".into();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        self.pinterest_jobs = pending;
+    }
+
+    fn finish_pinterest_download(&mut self, media: pinterest::PinterestMedia) {
+        let kind = match media.media_kind {
+            pinterest::PinterestMediaKind::Image => "img",
+            pinterest::PinterestMediaKind::Video => "video",
+        };
+        let natural = Vec2::new(media.width.max(1) as f32, media.height.max(1) as f32);
+        let scale = (640.0 / natural.x).min(480.0 / natural.y).min(1.0);
+        let width = (natural.x * scale).max(10.0);
+        let height = (natural.y * scale).max(10.0);
+        let position = 100.0 + self.scene.elements.len() as f32 * 20.0;
+        let local_path = media.local_path;
+        let mut element = Element::new(
+            local_path.to_string_lossy().into_owned(),
+            kind,
+            position,
+            position,
+            width,
+            height,
+        );
+        element.source_url = Some(media.original_url);
+        element.cached_path = Some(local_path);
+        element.media_duration = media.duration;
+        self.scene.elements.push(element);
+        self.selected = self.scene.elements.len().checked_sub(1);
+        self.status = match media.media_kind {
+            pinterest::PinterestMediaKind::Image => "Pinterest image added".into(),
+            pinterest::PinterestMediaKind::Video => "Pinterest video added".into(),
+        };
     }
 
     fn ensure_assets(&mut self, ctx: &EguiContext) {
@@ -1009,6 +1144,9 @@ impl AnimRefApp {
     fn queue_action(&mut self, action: AppAction) {
         self.actions.push_back(action);
         self.context_menu_pos = None;
+        self.context_menu_item = false;
+        self.context_submenu = None;
+        self.context_submenu_anchor = None;
     }
 
     fn run_actions(&mut self, ctx: &EguiContext) {
@@ -1038,6 +1176,11 @@ impl AnimRefApp {
                 AppAction::AddText => self.show_text_dialog = true,
                 AppAction::PrepareYoutube { url, target_id } => {
                     self.start_youtube_metadata(url, target_id)
+                }
+                AppAction::OpenSourceLink(url) => {
+                    if url.starts_with("https://") || url.starts_with("http://") {
+                        ctx.open_url(egui::OpenUrl::new_tab(url));
+                    }
                 }
                 AppAction::ToggleGrid => {
                     self.scene.grid.enabled = !self.scene.grid.enabled;
@@ -1386,6 +1529,7 @@ impl AnimRefApp {
     }
 
     fn draw_hover_header(&mut self, ctx: &EguiContext) {
+        self.diagnostic_header_rect = None;
         let pointer = ctx.input(|input| input.pointer.hover_pos());
         let show =
             self.cli.ui_scenario == UiScenario::Title || pointer.is_some_and(|pos| pos.y <= 42.0);
@@ -1408,9 +1552,9 @@ impl AnimRefApp {
                     .fill(Color32::from_rgba_unmultiplied(32, 35, 41, 245))
                     .inner_margin(egui::Margin::symmetric(10, 5))
                     .show(ui, |ui| {
-                        ui.set_width((width - 20.0).max(280.0));
+                        ui.set_width((width - 20.0).max(200.0));
                         ui.horizontal(|ui| {
-                            let title_width = (ui.available_width() - 148.0).max(72.0);
+                            let title_width = (ui.available_width() - 132.0).max(56.0);
                             let (title_rect, drag) =
                                 ui.allocate_exact_size(Vec2::new(title_width, 25.0), Sense::drag());
                             let drag = drag.on_hover_text(
@@ -1421,16 +1565,25 @@ impl AnimRefApp {
                             );
                             let title_color = ui.visuals().text_color();
                             let title_font = egui::FontId::proportional(16.0);
+                            let title_center = width * 0.5;
+                            let text_right = (title_rect.right() - 8.0).min(width - 10.0);
+                            let half_text_width = (title_center - title_rect.left())
+                                .min(text_right - title_center)
+                                .max(1.0);
+                            let text_rect = Rect::from_center_size(
+                                Pos2::new(title_center, title_rect.center().y),
+                                Vec2::new(half_text_width * 2.0, title_rect.height()),
+                            );
                             let title_galley = ellipsized_galley(
                                 ui.painter(),
                                 &title,
                                 title_font,
                                 title_color,
-                                title_rect.width(),
+                                text_rect.width(),
                             );
-                            ui.painter().with_clip_rect(title_rect).galley(
+                            ui.painter().with_clip_rect(text_rect).galley(
                                 Pos2::new(
-                                    title_rect.left(),
+                                    text_rect.center().x - title_galley.size().x * 0.5,
                                     title_rect.center().y - title_galley.size().y * 0.5,
                                 ),
                                 title_galley,
@@ -1439,257 +1592,334 @@ impl AnimRefApp {
                             if drag.dragged() {
                                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                             }
-                            let pin = ui
-                                .add_sized([28.0, 25.0], egui::Button::new(""))
-                                .on_hover_text(if self.always_on_top {
+                            let pin = icon_button(
+                                ui,
+                                if self.always_on_top {
+                                    egui_phosphor::regular::PUSH_PIN
+                                } else {
+                                    egui_phosphor::regular::PUSH_PIN_SIMPLE
+                                },
+                                if self.always_on_top {
                                     "Always on top (enabled)"
                                 } else {
                                     "Always on top (disabled)"
-                                });
-                            let pin_color = if self.always_on_top {
-                                Color32::from_rgb(90, 190, 235)
+                                },
+                            )
+                            .on_hover_text(if self.always_on_top {
+                                "Always on top (enabled)"
                             } else {
-                                Color32::from_gray(190)
-                            };
-                            let pin_head =
-                                Pos2::new(pin.rect.center().x, pin.rect.center().y - 5.0);
-                            ui.painter().circle_filled(pin_head, 3.0, pin_color);
-                            ui.painter().line_segment(
-                                [
-                                    pin_head + Vec2::new(0.0, 2.0),
-                                    pin_head + Vec2::new(-4.0, 9.0),
-                                ],
-                                Stroke::new(2.0_f32, pin_color),
-                            );
-                            ui.painter().line_segment(
-                                [
-                                    pin_head + Vec2::new(-6.0, 9.0),
-                                    pin_head + Vec2::new(2.0, 9.0),
-                                ],
-                                Stroke::new(1.5_f32, pin_color),
-                            );
+                                "Always on top (disabled)"
+                            });
                             if pin.clicked() {
                                 self.queue_action(AppAction::TogglePin);
                             }
-                            if ui
-                                .add_sized([28.0, 25.0], egui::Button::new("—"))
-                                .on_hover_text("Minimize")
-                                .clicked()
+                            if icon_button(ui, egui_phosphor::regular::MINUS, "Minimize").clicked()
                             {
                                 self.queue_action(AppAction::Minimize);
                             }
                             let maximized =
                                 ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-                            if ui
-                                .add_sized(
-                                    [28.0, 25.0],
-                                    egui::Button::new(if maximized { "❐" } else { "□" }),
-                                )
-                                .on_hover_text("Maximize / restore")
-                                .clicked()
+                            if icon_button(
+                                ui,
+                                if maximized {
+                                    egui_phosphor::regular::CORNERS_IN
+                                } else {
+                                    egui_phosphor::regular::CORNERS_OUT
+                                },
+                                "Maximize / restore",
+                            )
+                            .clicked()
                             {
                                 self.queue_action(AppAction::ToggleMaximize);
                             }
-                            if ui
-                                .add_sized([28.0, 25.0], egui::Button::new("×"))
-                                .on_hover_text("Close")
-                                .clicked()
-                            {
+                            if icon_button(ui, egui_phosphor::regular::X, "Close").clicked() {
                                 self.queue_action(AppAction::Close);
                             }
                         });
                     });
             });
+        self.diagnostic_header_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 40.0)));
     }
 
     fn draw_context_menu(&mut self, ctx: &EguiContext) {
         let Some(raw_position) = self.context_menu_pos else {
+            self.diagnostic_menu_rect = None;
             return;
         };
         let screen = ctx.screen_rect();
+        let width = 212.0_f32.min((screen.width() - 16.0).max(120.0));
         let position = Pos2::new(
             raw_position.x.clamp(
                 screen.left() + 8.0,
-                (screen.right() - 248.0).max(screen.left() + 8.0),
+                (screen.right() - width - 8.0).max(screen.left() + 8.0),
             ),
             raw_position.y.clamp(
                 screen.top() + 8.0,
-                (screen.bottom() - 340.0).max(screen.top() + 8.0),
+                (screen.bottom() - 250.0).max(screen.top() + 8.0),
             ),
         );
         let mut action = None;
-        let area = egui::Area::new(egui::Id::new("canvas-context-menu"))
+        let mut submenu_anchor = None;
+        let mut menu_rect = Rect::NOTHING;
+        egui::Area::new(egui::Id::new("canvas-context-menu"))
             .fixed_pos(position)
-            .constrain(true)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
-                    .max_height((screen.height() - 24.0).max(160.0))
+                    .max_height((screen.height() - 16.0).max(100.0))
                     .show(ui, |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            ui.set_min_width(232.0);
-                            ui.spacing_mut().interact_size.y = 22.0;
+                            ui.set_min_width(width);
+                            ui.set_max_width(width);
+                            ui.spacing_mut().interact_size.y = 25.0;
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            for (label, candidate) in [
-                                ("Open…", AppAction::OpenScene),
-                                ("Save", AppAction::Save),
-                                ("Save As…", AppAction::SaveAs),
-                                ("New", AppAction::NewScene),
-                                ("Import media…", AppAction::ImportMedia),
-                                ("Add text…", AppAction::AddText),
-                                ("Paste", AppAction::Paste),
-                            ] {
-                                if context_menu_row(ui, label, true).clicked() {
-                                    action = Some(candidate);
-                                }
-                            }
-                            let media_not_local = self
-                                .selected
-                                .and_then(|index| self.scene.elements.get(index))
-                                .is_some_and(|element| {
+                            if self.context_menu_item {
+                                let selected = self
+                                    .selected
+                                    .and_then(|index| self.scene.elements.get(index));
+                                let media_not_local = selected.is_some_and(|element| {
                                     (element.media_type == "youtube" || is_http_url(&element.path))
                                         && element
                                             .cached_path
                                             .as_ref()
                                             .is_none_or(|path| !path.exists())
                                 });
-                            if context_menu_row(ui, "Copy selected", !media_not_local)
-                                .on_hover_text(if media_not_local {
-                                    "This media has no local file to copy or export yet"
-                                } else {
-                                    "Copy selected content to the system clipboard"
-                                })
-                                .clicked()
-                            {
-                                action = Some(AppAction::CopySelected);
-                            }
-                            if context_menu_row(ui, "Export selected…", !media_not_local)
-                                .on_hover_text(if media_not_local {
-                                    "This media has no local file to copy or export yet"
-                                } else {
-                                    "Export the original media file"
-                                })
-                                .clicked()
-                            {
-                                action = Some(AppAction::ExportSelected);
-                            }
-                            ui.separator();
-                            for (label, candidate) in [
-                                ("Bring forward", AppAction::BringForward),
-                                ("Send back", AppAction::SendBackward),
-                                ("Delete", AppAction::DeleteSelected),
-                                (
-                                    if self.scene.grid.enabled {
-                                        "✓  Grid & snap"
+                                if context_menu_row(ui, "Copy", !media_not_local)
+                                    .on_hover_text(if media_not_local {
+                                        "This media has no local file to copy or export yet"
                                     } else {
-                                        "Grid & snap"
-                                    },
-                                    AppAction::ToggleGrid,
-                                ),
-                                ("Center view", AppAction::CenterView),
-                                ("Fit all", AppAction::FitView),
-                            ] {
-                                if context_menu_row(ui, label, true).clicked() {
-                                    action = Some(candidate);
+                                        "Copy this item to the system clipboard"
+                                    })
+                                    .clicked()
+                                {
+                                    action = Some(AppAction::CopySelected);
                                 }
-                            }
-                            ui.menu_button("Recent", |ui| {
-                                for path in self.recent.clone().into_iter().rev() {
-                                    let label = path
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .into_owned();
-                                    if context_menu_row(ui, &label, true)
-                                        .on_hover_text(path.display().to_string())
+                                if context_menu_row(ui, "Export…", !media_not_local).clicked() {
+                                    action = Some(AppAction::ExportSelected);
+                                }
+                                ui.separator();
+                                if context_menu_row(ui, "Bring forward", true).clicked() {
+                                    action = Some(AppAction::BringForward);
+                                }
+                                if context_menu_row(ui, "Send backward", true).clicked() {
+                                    action = Some(AppAction::SendBackward);
+                                }
+                                if context_menu_row(ui, "Delete", true).clicked() {
+                                    action = Some(AppAction::DeleteSelected);
+                                }
+                                if let Some(element) = selected {
+                                    if let Some(source_url) = element.source_link()
+                                        && context_menu_row(ui, "Open source link", true)
+                                            .on_hover_text(source_url.to_owned())
+                                            .clicked()
+                                    {
+                                        action =
+                                            Some(AppAction::OpenSourceLink(source_url.to_owned()));
+                                    }
+                                    let has_duration = element.media_duration.is_some()
+                                        || self
+                                            .presented_playback
+                                            .get(&element.id)
+                                            .and_then(|snapshot| snapshot.duration_seconds)
+                                            .is_some();
+                                    if element.is_video() && has_duration {
+                                        let response = context_menu_submenu_row(
+                                            ui,
+                                            "Playback",
+                                            self.context_submenu == Some("Playback"),
+                                        );
+                                        if response.hovered() || response.clicked() {
+                                            submenu_anchor = Some(("Playback", response.rect));
+                                        }
+                                    }
+                                    if element.media_type == "youtube"
+                                        && context_menu_row(
+                                            ui,
+                                            if element
+                                                .cached_path
+                                                .as_ref()
+                                                .is_some_and(|path| path.exists())
+                                            {
+                                                "Download another section…"
+                                            } else {
+                                                "Choose section…"
+                                            },
+                                            true,
+                                        )
                                         .clicked()
                                     {
-                                        action = Some(AppAction::OpenRecent(path));
+                                        action = Some(AppAction::PrepareYoutube {
+                                            url: element.path.clone(),
+                                            target_id: Some(element.id),
+                                        });
                                     }
                                 }
-                            });
-                            ui.menu_button("Window", |ui| {
+                            } else {
                                 for (label, candidate) in [
-                                    ("Always on top", AppAction::TogglePin),
-                                    ("Maximize / restore", AppAction::ToggleMaximize),
-                                    ("Minimize", AppAction::Minimize),
-                                    ("Close", AppAction::Close),
+                                    ("Open…", AppAction::OpenScene),
+                                    ("Save", AppAction::Save),
+                                    ("Save As…", AppAction::SaveAs),
+                                    ("New", AppAction::NewScene),
+                                    ("Import media…", AppAction::ImportMedia),
+                                    ("Add text…", AppAction::AddText),
+                                    ("Paste", AppAction::Paste),
                                 ] {
                                     if context_menu_row(ui, label, true).clicked() {
                                         action = Some(candidate);
                                     }
                                 }
-                            });
-                            if let Some(index) = self
-                                .selected
-                                .filter(|index| *index < self.scene.elements.len())
-                            {
-                                let element = &self.scene.elements[index];
-                                let has_duration = element.media_duration.is_some()
-                                    || self
-                                        .presented_playback
-                                        .get(&element.id)
-                                        .and_then(|snapshot| snapshot.duration_seconds)
-                                        .is_some();
-                                if element.is_video() && has_duration {
-                                    ui.menu_button("Playback", |ui| {
-                                        if context_menu_row(ui, "Set loop start here", true)
-                                            .clicked()
-                                        {
-                                            action = Some(AppAction::SetLoopStart);
-                                        }
-                                        if context_menu_row(ui, "Set loop end here", true).clicked()
-                                        {
-                                            action = Some(AppAction::SetLoopEnd);
-                                        }
-                                        if context_menu_row(ui, "Reset active loop", true).clicked()
-                                        {
-                                            action = Some(AppAction::ResetLoop);
-                                        }
-                                    });
+                                ui.separator();
+                                let grid = context_menu_check_row(
+                                    ui,
+                                    "Grid & snap",
+                                    self.scene.grid.enabled,
+                                );
+                                if grid.clicked() {
+                                    action = Some(AppAction::ToggleGrid);
                                 }
-                                if element.media_type == "youtube"
-                                    && context_menu_row(
-                                        ui,
-                                        if element
-                                            .cached_path
-                                            .as_ref()
-                                            .is_some_and(|path| path.exists())
-                                        {
-                                            "Download another section…"
-                                        } else {
-                                            "Choose section…"
-                                        },
-                                        true,
-                                    )
-                                    .clicked()
+                                if context_menu_row(ui, "Center view", true).clicked() {
+                                    action = Some(AppAction::CenterView);
+                                }
+                                if context_menu_row(ui, "Fit all", true).clicked() {
+                                    action = Some(AppAction::FitView);
+                                }
+                                let recent = context_menu_submenu_row(
+                                    ui,
+                                    "Recent",
+                                    self.context_submenu == Some("Recent"),
+                                );
+                                if recent.hovered()
+                                    || recent.clicked()
+                                    || self.cli.ui_scenario == UiScenario::RecentMenu
                                 {
-                                    action = Some(AppAction::PrepareYoutube {
-                                        url: element.path.clone(),
-                                        target_id: Some(element.id),
-                                    });
+                                    submenu_anchor = Some(("Recent", recent.rect));
+                                }
+                                let window = context_menu_submenu_row(
+                                    ui,
+                                    "Window",
+                                    self.context_submenu == Some("Window"),
+                                );
+                                if window.hovered()
+                                    || window.clicked()
+                                    || self.cli.ui_scenario == UiScenario::WindowMenu
+                                {
+                                    submenu_anchor = Some(("Window", window.rect));
                                 }
                             }
                         });
                     });
+                menu_rect = ui.min_rect();
             });
+        self.diagnostic_menu_rect = Some(menu_rect);
+        let mut submenu_rect = None;
+        if let Some((name, row_rect)) = submenu_anchor {
+            self.context_submenu = Some(name);
+            self.context_submenu_anchor = Some(row_rect);
+        }
+        if let Some(name) = self.context_submenu {
+            let anchor = self.context_submenu_anchor.unwrap_or(menu_rect);
+            let submenu_pos = Pos2::new(
+                if anchor.right() + width <= screen.right() {
+                    anchor.right() - 2.0
+                } else {
+                    anchor.left() - width + 2.0
+                },
+                anchor.top().clamp(
+                    screen.top() + 8.0,
+                    (screen.bottom() - 100.0).max(screen.top() + 8.0),
+                ),
+            );
+            egui::Area::new(egui::Id::new(("context-submenu", name)))
+                .fixed_pos(submenu_pos)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height((screen.height() - 16.0).max(100.0))
+                        .show(ui, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(width);
+                                ui.set_max_width(width);
+                                ui.spacing_mut().interact_size.y = 25.0;
+                                match name {
+                                    "Playback" => {
+                                        for (label, candidate) in [
+                                            ("Set loop start here", AppAction::SetLoopStart),
+                                            ("Set loop end here", AppAction::SetLoopEnd),
+                                            ("Reset active loop", AppAction::ResetLoop),
+                                        ] {
+                                            if context_menu_row(ui, label, true).clicked() {
+                                                action = Some(candidate);
+                                            }
+                                        }
+                                    }
+                                    "Recent" => {
+                                        let paths = self.recent.clone();
+                                        if paths.is_empty() {
+                                            ui.label("No recent scenes");
+                                        }
+                                        for path in paths.into_iter().rev() {
+                                            let label = path
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .into_owned();
+                                            if context_menu_row(ui, &label, true)
+                                                .on_hover_text(path.display().to_string())
+                                                .clicked()
+                                            {
+                                                action = Some(AppAction::OpenRecent(path));
+                                            }
+                                        }
+                                    }
+                                    "Window" => {
+                                        let pin = context_menu_check_row(
+                                            ui,
+                                            "Always on top",
+                                            self.always_on_top,
+                                        );
+                                        if pin.clicked() {
+                                            action = Some(AppAction::TogglePin);
+                                        }
+                                        for (label, candidate) in [
+                                            ("Maximize / restore", AppAction::ToggleMaximize),
+                                            ("Minimize", AppAction::Minimize),
+                                            ("Close", AppAction::Close),
+                                        ] {
+                                            if context_menu_row(ui, label, true).clicked() {
+                                                action = Some(candidate);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            });
+                        });
+                    submenu_rect = Some(ui.min_rect());
+                });
+        }
         if let Some(action) = action {
             self.queue_action(action);
         }
-        let menu_rect = area.response.rect;
+        let pointer = ctx.input(|input| input.pointer.interact_pos());
         let clicked_elsewhere = ctx.input(|input| input.pointer.any_click())
-            && ctx.input(|input| {
-                input
-                    .pointer
-                    .interact_pos()
-                    .is_some_and(|point| !menu_rect.contains(point))
+            && pointer.is_some_and(|point| {
+                !menu_rect.contains(point) && !submenu_rect.is_some_and(|rect| rect.contains(point))
             });
+        let pointer_in_transition = pointer.is_some_and(|point| {
+            submenu_rect.is_some_and(|rect| rect.expand(6.0).contains(point))
+                || menu_rect.expand(6.0).contains(point)
+        });
         if clicked_elsewhere {
             self.context_menu_pos = None;
+            self.context_submenu = None;
+            self.context_submenu_anchor = None;
+            self.context_menu_item = false;
+        } else if submenu_rect.is_none() && !pointer_in_transition {
+            self.context_submenu = None;
         }
     }
-
     fn draw_selection_bar(&mut self, ctx: &EguiContext) {
+        self.diagnostic_transport_rect = None;
         let Some(index) = self
             .selected
             .filter(|index| *index < self.scene.elements.len())
@@ -1725,32 +1955,50 @@ impl AnimRefApp {
             .get(&id)
             .copied()
             .unwrap_or(state.position_seconds);
-        egui::Area::new(egui::Id::new("animation-transport"))
-            .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -16.0))
+        let transport =
+            transport_overlay_rect(ctx, &self.scene, element, state.duration_seconds.is_some());
+        let max_width = transport.width();
+        let response = egui::Area::new(egui::Id::new("animation-transport"))
+            .fixed_pos(transport.min)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                ui.set_max_width(max_width);
                 egui::Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(30, 34, 43, 238))
                     .corner_radius(8.0)
                     .inner_margin(egui::Margin::symmetric(8, 5))
                     .show(ui, |ui| {
+                        ui.set_min_width((max_width - 16.0).max(64.0));
                         ui.horizontal(|ui| {
-                            if ui.small_button("|◀").clicked() {
+                            if icon_button(ui, egui_phosphor::regular::SKIP_BACK, "Previous frame")
+                                .clicked()
+                            {
                                 self.queue_action(AppAction::StepAnimation(-1));
                             }
-                            if ui
-                                .small_button(if state.paused { "▶" } else { "Ⅱ" })
-                                .clicked()
+                            if icon_button(
+                                ui,
+                                if state.paused {
+                                    egui_phosphor::regular::PLAY
+                                } else {
+                                    egui_phosphor::regular::PAUSE
+                                },
+                                if state.paused { "Play" } else { "Pause" },
+                            )
+                            .clicked()
                             {
                                 self.queue_action(AppAction::PlayPause);
                             }
-                            if ui.small_button("▶|").clicked() {
+                            if icon_button(ui, egui_phosphor::regular::SKIP_FORWARD, "Next frame")
+                                .clicked()
+                            {
                                 self.queue_action(AppAction::StepAnimation(1));
                             }
                             if let Some(duration) =
                                 state.duration_seconds.filter(|duration| *duration > 0.0)
                             {
-                                let response = ui.add(
+                                let slider_width = (ui.available_width() - 84.0).clamp(40.0, 180.0);
+                                let response = ui.add_sized(
+                                    [slider_width, 18.0],
                                     egui::Slider::new(&mut seek, 0.0..=duration)
                                         .show_value(false)
                                         .trailing_fill(true)
@@ -1758,7 +2006,13 @@ impl AnimRefApp {
                                         .min_decimals(2)
                                         .max_decimals(2),
                                 );
-                                ui.label(format!("{:.2}/{:.2}s", state.position_seconds, duration));
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{:.1}/{:.1}s",
+                                        state.position_seconds, duration
+                                    ))
+                                    .size(11.0),
+                                );
                                 let response_has_focus = response.has_focus();
                                 let (pointer_down, keyboard_seek) = ctx.input(|input| {
                                     (
@@ -1795,9 +2049,11 @@ impl AnimRefApp {
                         });
                     });
             });
+        self.diagnostic_transport_rect = Some(response.response.rect);
     }
 
     fn draw_toast(&mut self, ctx: &EguiContext) {
+        self.diagnostic_toast_rect = None;
         if self.status != self.observed_status {
             self.observed_status = self.status.clone();
             if !self.status.is_empty() {
@@ -1807,18 +2063,42 @@ impl AnimRefApp {
         let Some((message, created)) = self.toast.as_ref() else {
             return;
         };
-        if created.elapsed() > Duration::from_secs(4) {
+        let toast_lifetime = if self.cli.ui_scenario == UiScenario::Toast {
+            Duration::from_secs(12)
+        } else {
+            Duration::from_secs(4)
+        };
+        if created.elapsed() > toast_lifetime {
             self.toast = None;
             return;
         }
-        egui::Area::new(egui::Id::new("toast"))
-            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 12.0))
+        let screen = ctx.screen_rect();
+        let mut toast_y = 42.0;
+        if let Some(transport) = self.diagnostic_transport_rect {
+            let toast_guess = Rect::from_center_size(
+                Pos2::new(screen.center().x, screen.top() + toast_y + 20.0),
+                Vec2::new((screen.width() - 32.0).min(360.0), 40.0),
+            );
+            if toast_guess.intersects(transport) {
+                toast_y = if transport.bottom() + 52.0 < screen.bottom() - 8.0 {
+                    transport.bottom() + 8.0
+                } else {
+                    -(screen.bottom() - transport.top() + 8.0)
+                };
+            }
+        }
+        let response = egui::Area::new(egui::Id::new("toast"))
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, toast_y))
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width((ctx.screen_rect().width() - 32.0).max(100.0));
                     ui.label(message);
                 });
-            });
+            })
+            .response
+            .rect;
+        self.diagnostic_toast_rect = Some(response);
     }
 
     fn update_diagnostics(&mut self, ctx: &EguiContext) {
@@ -1961,6 +2241,7 @@ impl AnimRefApp {
                     "width": element.width,
                     "height": element.height,
                     "sourceRange": element.source_range,
+                    "sourceUrl": element.source_link(),
                     "mediaDuration": element.media_duration,
                     "decodedFrames": self.decoded_video_frames_by_id.get(&element.id).copied().unwrap_or(0),
                     "playbackState": element.playback_state,
@@ -1974,7 +2255,7 @@ impl AnimRefApp {
         let report = serde_json::json!({
             "processId": std::process::id(),
             "scenePath": self.scene_path,
-            "uiScenario": match self.cli.ui_scenario { UiScenario::Clean => "clean", UiScenario::Title => "title", UiScenario::Menu => "menu", UiScenario::Playback => "playback", UiScenario::Youtube => "youtube", UiScenario::Grid => "grid" },
+            "uiScenario": match self.cli.ui_scenario { UiScenario::Clean => "clean", UiScenario::Title => "title", UiScenario::Menu => "menu", UiScenario::Playback => "playback", UiScenario::Youtube => "youtube", UiScenario::Grid => "grid", UiScenario::ItemMenu => "item-menu", UiScenario::WindowMenu => "window-menu", UiScenario::RecentMenu => "recent-menu", UiScenario::Toast => "toast", UiScenario::Resize => "resize" },
             "windowSize": self.cli.window_size,
             "actualViewportSize": [ctx.screen_rect().width(), ctx.screen_rect().height()],
             "pixelsPerPoint": ctx.pixels_per_point(),
@@ -1989,6 +2270,12 @@ impl AnimRefApp {
             "wantsKeyboardInput": self.diagnostic_wants_keyboard,
             "elements": elements,
             "status": self.status,
+            "menuRect": rect_json(self.diagnostic_menu_rect),
+            "transportRect": rect_json(self.diagnostic_transport_rect),
+            "headerRect": rect_json(self.diagnostic_header_rect),
+            "toastRect": rect_json(self.diagnostic_toast_rect),
+            "resizeHovered": self.resize_hovered,
+            "cursorIcon": ctx.output(|output| format!("{:?}", output.cursor_icon)),
         });
         let result = serde_json::to_vec_pretty(&report)
             .map_err(anyhow::Error::from)
@@ -2027,20 +2314,35 @@ impl AnimRefApp {
         self.ensure_assets(ctx);
         let modal_active = self.show_youtube.is_some() || self.show_text_dialog;
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::from_rgb(30, 30, 32)))
+            .frame(egui::Frame::new().fill(Color32::BLACK))
             .show(ctx, |ui| {
                 let canvas_rect = ui.max_rect();
                 let canvas = ui.allocate_rect(canvas_rect, Sense::click_and_drag());
                 let painter = ui.painter_at(canvas_rect);
                 self.paint_grid(&painter, canvas_rect);
+                self.resize_hovered = false;
                 let pointer = ctx.input(|input| input.pointer.interact_pos());
                 let overlay_blocks = modal_active
                     || self.context_menu_pos.is_some()
                     || pointer.is_some_and(|position| self.hovered_header && position.y <= 42.0)
                     || pointer.is_some_and(|position| {
-                        self.selected_id()
-                            .is_some_and(|id| self.playback_sessions.contains_key(&id))
-                            && position.y >= canvas_rect.bottom() - 70.0
+                        self.selected
+                            .and_then(|index| self.scene.elements.get(index))
+                            .is_some_and(|element| {
+                                let has_duration = element.media_duration.is_some()
+                                    || self
+                                        .presented_playback
+                                        .get(&element.id)
+                                        .and_then(|state| state.duration_seconds)
+                                        .is_some()
+                                    || self
+                                        .playback_sessions
+                                        .get(&element.id)
+                                        .and_then(|session| session.snapshot().duration_seconds)
+                                        .is_some();
+                                transport_overlay_rect(ctx, &self.scene, element, has_duration)
+                                    .contains(position)
+                            })
                     });
                 let (space_pan, ctrl_space_zoom) = ctx.input(|input| {
                     (
@@ -2081,6 +2383,14 @@ impl AnimRefApp {
                     let handle = selected.then(|| {
                         ui.interact(handle_rect, ui.id().with(("resize", id)), Sense::drag())
                     });
+                    if selected
+                        && handle.as_ref().is_some_and(|handle| {
+                            handle.hovered() || handle.is_pointer_button_down_on()
+                        })
+                    {
+                        self.resize_hovered = true;
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                    }
                     if !overlay_blocks && response.clicked_by(egui::PointerButton::Primary) {
                         self.selected = Some(index);
                         bring_front = Some(id);
@@ -2247,7 +2557,7 @@ impl AnimRefApp {
             return;
         }
         let mut step = self.scene.grid.spacing.max(1.0) * self.scene.current_scale.max(0.01);
-        while step < 18.0 {
+        while step < 24.0 {
             step *= 2.0;
         }
         if step > 240.0 {
@@ -2259,19 +2569,12 @@ impl AnimRefApp {
         let color = Color32::from_gray(48);
         let mut x = first_x;
         while x < rect.right() {
-            painter.line_segment(
-                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                Stroke::new(1.0_f32, color),
-            );
+            let mut y = first_y;
+            while y < rect.bottom() {
+                painter.circle_filled(Pos2::new(x, y), 1.15, color);
+                y += step;
+            }
             x += step;
-        }
-        let mut y = first_y;
-        while y < rect.bottom() {
-            painter.line_segment(
-                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-                Stroke::new(1.0_f32, color),
-            );
-            y += step;
         }
     }
 
@@ -2740,6 +3043,9 @@ impl AnimRefApp {
         }
         if ctx.input(|input| input.key_pressed(Key::Escape)) {
             self.context_menu_pos = None;
+            self.context_menu_item = false;
+            self.context_submenu = None;
+            self.context_submenu_anchor = None;
         }
         if !wants_keyboard && ctx.input(|input| input.key_pressed(Key::K)) {
             self.queue_action(AppAction::PlayPause);
@@ -2788,6 +3094,8 @@ impl eframe::App for AnimRefApp {
         {
             self.select_under_pointer(position);
             self.context_menu_pos = Some(position);
+            self.context_menu_item = self.selected_id().is_some();
+            self.context_submenu = None;
         }
         self.run_actions(ctx);
         if let Some(result) =
@@ -2797,6 +3105,7 @@ impl eframe::App for AnimRefApp {
             self.handle_dialog_result(result);
         }
         self.drain_remote_imports();
+        self.drain_pinterest_imports();
         self.draw_canvas_surface(ctx);
         self.draw_hover_header(ctx);
         self.draw_selection_bar(ctx);
@@ -2805,6 +3114,9 @@ impl eframe::App for AnimRefApp {
         self.draw_other_windows(ctx);
         self.draw_toast(ctx);
         self.begin_window_resize(ctx);
+        if self.smoke_report_written {
+            self.write_smoke_report(ctx);
+        }
         ctx.request_repaint_after(Duration::from_millis(33));
     }
 }
@@ -2961,13 +3273,59 @@ fn ellipsized_galley(
     best
 }
 
+fn transport_overlay_rect(
+    ctx: &EguiContext,
+    scene: &Scene,
+    element: &Element,
+    has_timeline: bool,
+) -> Rect {
+    let screen = ctx.screen_rect();
+    let size = Vec2::new(
+        (if has_timeline { 300.0_f32 } else { 160.0_f32 }).min((screen.width() - 16.0).max(120.0)),
+        50.0,
+    );
+    let scale = scene.current_scale.max(0.01);
+    let item = Rect::from_min_size(
+        screen.min
+            + Vec2::new(scene.translate.x, scene.translate.y)
+            + Vec2::new(element.x, element.y) * scale,
+        Vec2::new(
+            element.width.unwrap_or(320.0),
+            element.height.unwrap_or(200.0),
+        ) * scale,
+    );
+    let mut x = item.center().x - size.x * 0.5;
+    x = x.clamp(
+        screen.left() + 8.0,
+        (screen.right() - size.x - 8.0).max(screen.left() + 8.0),
+    );
+    let below = item.bottom() + 8.0;
+    let y = if below + size.y <= screen.bottom() - 8.0 {
+        below
+    } else {
+        (item.top() - size.y - 8.0).max(screen.top() + 8.0)
+    };
+    Rect::from_min_size(Pos2::new(x, y), size)
+}
+
+fn rect_json(rect: Option<Rect>) -> serde_json::Value {
+    rect.map(|rect| {
+        serde_json::json!({
+            "left": rect.left(), "top": rect.top(), "right": rect.right(), "bottom": rect.bottom(),
+            "width": rect.width(), "height": rect.height()
+        })
+    })
+    .unwrap_or(serde_json::Value::Null)
+}
+
 fn context_menu_row(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
     let sense = if enabled {
         Sense::click()
     } else {
         Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), sense);
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width().min(228.0), 25.0), sense);
     let visuals = if response.is_pointer_button_down_on() {
         &ui.visuals().widgets.active
     } else if response.hovered() {
@@ -2988,16 +3346,66 @@ fn context_menu_row(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Resp
         label,
         egui::FontId::proportional(15.0),
         color,
-        (rect.width() - 16.0).max(1.0),
+        (rect.width() - 48.0).max(1.0),
     );
     ui.painter()
         .with_clip_rect(rect.shrink2(Vec2::new(7.0, 0.0)))
         .galley(
-            Pos2::new(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5),
+            Pos2::new(rect.left() + 31.0, rect.center().y - galley.size().y * 0.5),
             galley,
             color,
         );
     response
+}
+
+fn context_menu_check_row(ui: &mut egui::Ui, label: &str, checked: bool) -> egui::Response {
+    let response = context_menu_row(ui, label, true);
+    if checked {
+        ui.painter().text(
+            Pos2::new(response.rect.left() + 14.0, response.rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            egui_phosphor::regular::CHECK,
+            phosphor_font(16.0),
+            ui.visuals().text_color(),
+        );
+    }
+    response
+}
+
+fn context_menu_submenu_row(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let response = context_menu_row(ui, label, true);
+    ui.painter().text(
+        Pos2::new(response.rect.right() - 15.0, response.rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        egui_phosphor::regular::CARET_RIGHT,
+        phosphor_font(15.0),
+        if active {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        },
+    );
+    response
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::click());
+    if response.hovered() || response.is_pointer_button_down_on() {
+        ui.painter()
+            .rect_filled(rect, 5.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        phosphor_font(16.0),
+        ui.visuals().text_color(),
+    );
+    response.on_hover_text(tooltip)
+}
+
+fn phosphor_font(size: f32) -> FontId {
+    FontId::proportional(size)
 }
 
 fn remote_url_is_video(value: &str) -> bool {
@@ -3031,6 +3439,7 @@ fn clipboard_path(text: &str) -> Option<PathBuf> {
 
 fn install_cjk_font(ctx: &EguiContext) {
     let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     for candidate in [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\simhei.ttf",
@@ -3046,16 +3455,42 @@ fn install_cjk_font(ctx: &EguiContext) {
                     entries.push("animref-cjk".into());
                 }
             }
-            ctx.set_fonts(fonts);
-            return;
+            break;
         }
     }
+    ctx.set_fonts(fonts);
 }
 
 fn is_youtube_url(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     (lower.contains("youtube.com/") || lower.contains("youtu.be/"))
         && (lower.starts_with("http://") || lower.starts_with("https://"))
+}
+
+fn is_pinterest_pin_url(text: &str) -> bool {
+    let Some((scheme, remainder)) = text.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let host_and_path = remainder.split(['?', '#']).next().unwrap_or_default();
+    let (host, path) = host_and_path.split_once('/').unwrap_or((host_and_path, ""));
+    let host = host
+        .split('@')
+        .next_back()
+        .unwrap_or(host)
+        .split(':')
+        .next()
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    if host == "pin.it" || host == "www.pin.it" {
+        return !path.is_empty();
+    }
+    (host == "pinterest.com"
+        || host.ends_with(".pinterest.com")
+        || host.strip_prefix("pinterest.").is_some())
+        && path.split('/').any(|part| part.eq_ignore_ascii_case("pin"))
 }
 
 fn parse_time(text: &str) -> Option<f64> {
@@ -3158,6 +3593,7 @@ mod tests {
             image_assets: HashMap::new(),
             image_errors: HashMap::new(),
             remote_jobs: Vec::new(),
+            pinterest_jobs: Vec::new(),
             remote_pending: HashSet::new(),
             scene_generation: 1,
             cli: CliOptions::default(),
@@ -3176,6 +3612,14 @@ mod tests {
             dialogs: DialogCoordinator::default(),
             toast: None,
             context_menu_pos: None,
+            context_menu_item: false,
+            context_submenu: None,
+            context_submenu_anchor: None,
+            diagnostic_menu_rect: None,
+            diagnostic_transport_rect: None,
+            diagnostic_header_rect: None,
+            diagnostic_toast_rect: None,
+            resize_hovered: false,
             hovered_header: false,
             last_presented_position: HashMap::new(),
             animation_paused: HashMap::new(),
@@ -3317,6 +3761,41 @@ mod tests {
                 "playhead display rounding staged a seek"
             );
         }
+    }
+
+    #[test]
+    fn resize_handle_hover_uses_diagonal_resize_cursor() {
+        let mut app = app_for_shortcut_test(PathBuf::new());
+        app.scene.elements.push(Element::new(
+            "Resize cursor fixture".into(),
+            "text",
+            100.0,
+            100.0,
+            200.0,
+            100.0,
+        ));
+        app.selected = Some(0);
+        let context = EguiContext::default();
+        let frame = |context: &EguiContext, app: &mut AnimRefApp, events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw_canvas_surface(ctx),
+            )
+        };
+        let _ = frame(&context, &mut app, Vec::new());
+        let output = frame(
+            &context,
+            &mut app,
+            vec![egui::Event::PointerMoved(Pos2::new(294.0, 194.0))],
+        );
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::ResizeNwSe
+        );
     }
 
     #[test]

@@ -85,6 +85,53 @@ fn is_youtube_video_url(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+/// Accept only an absolute HTTP(S) URL with an unambiguous public authority.
+/// This is intentionally small and conservative because the value is handed to
+/// the operating system's browser opener.
+fn is_safe_source_url(value: &str) -> bool {
+    let value = value.trim();
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || value.contains('\\')
+    {
+        return false;
+    }
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let mut authority_parts = authority.split(':');
+    let host = authority_parts
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.');
+    if let Some(port) = authority_parts.next()
+        && (authority_parts.next().is_some()
+            || port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().ok().is_none_or(|port| port == 0))
+    {
+        return false;
+    }
+    !host.is_empty()
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        && !host.contains("..")
+        && host
+            .split('.')
+            .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'))
+}
+
 fn fresh_element_id() -> u64 {
     NEXT_ELEMENT_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -123,6 +170,8 @@ pub struct Element {
     pub id: u64,
     #[serde(default)]
     pub path: String,
+    #[serde(default, rename = "sourceUrl", skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
     #[serde(default, rename = "type")]
     pub media_type: String,
     #[serde(default, deserialize_with = "deserialize_null_f32_as_zero")]
@@ -178,11 +227,26 @@ pub struct Element {
 }
 
 impl Element {
+    /// Original remote source for opening in the system browser, if safe.
+    /// Legacy YouTube scenes stored their original URL in `path`.
+    pub fn source_link(&self) -> Option<&str> {
+        if let Some(url) = self.source_url.as_deref()
+            && is_safe_source_url(url)
+        {
+            return Some(url);
+        }
+        (self.media_type == "youtube"
+            && is_youtube_video_url(&self.path)
+            && is_safe_source_url(&self.path))
+        .then_some(self.path.as_str())
+    }
+
     pub fn new(path: String, media_type: &str, x: f32, y: f32, width: f32, height: f32) -> Self {
         let is_video = matches!(media_type, "video" | "youtube");
         Self {
             id: fresh_element_id(),
             path,
+            source_url: None,
             media_type: media_type.to_owned(),
             x,
             y,
@@ -371,6 +435,13 @@ impl Scene {
             {
                 element.media_type = "youtube".into();
             }
+            if element.source_url.is_none()
+                && element.media_type == "youtube"
+                && is_youtube_video_url(&element.path)
+                && is_safe_source_url(&element.path)
+            {
+                element.source_url = Some(element.path.clone());
+            }
             if element.id == 0 || !seen_ids.insert(element.id) {
                 element.id = fresh_element_id();
                 seen_ids.insert(element.id);
@@ -558,6 +629,50 @@ mod tests {
         assert_eq!(scene.elements[0].height, Some(360.0));
         assert_eq!(scene.elements[1].media_type, "img");
         assert_eq!(scene.elements[2].media_type, "filePath");
+    }
+
+    #[test]
+    fn legacy_youtube_source_is_preserved_explicitly_without_touching_source_timing() {
+        let scene = Scene::from_json(
+            r#"{"elements":[{"type":"youtube","path":"https://youtu.be/bmuBzhuuqno?feature=shared","sourceRange":[1.5,4.0],"sourceDuration":12.0}]}"#,
+        )
+        .unwrap();
+        let element = &scene.elements[0];
+        assert_eq!(
+            element.source_link(),
+            Some("https://youtu.be/bmuBzhuuqno?feature=shared")
+        );
+        assert_eq!(element.source_range, Some([1.5, 4.0]));
+        assert_eq!(element.source_duration, Some(12.0));
+        let json = scene.to_json().unwrap();
+        assert!(json.contains("\"sourceUrl\": \"https://youtu.be/bmuBzhuuqno?feature=shared\""));
+        let reread = Scene::from_json(&json).unwrap();
+        assert_eq!(reread.elements[0].source_url, element.source_url);
+        assert_eq!(reread.elements[0].source_range, element.source_range);
+        assert_eq!(reread.elements[0].source_duration, element.source_duration);
+    }
+
+    #[test]
+    fn source_link_rejects_unsafe_urls_but_round_trips_pinterest_source() {
+        let mut scene = Scene::default();
+        let mut element = Element::new("pin.jpg".into(), "img", 0.0, 0.0, 100.0, 80.0);
+        element.source_url = Some("https://www.pinterest.com/pin/123456789/".into());
+        scene.elements.push(element);
+        let json = scene.to_json().unwrap();
+        assert!(json.contains("\"sourceUrl\": \"https://www.pinterest.com/pin/123456789/\""));
+        let reread = Scene::from_json(&json).unwrap();
+        assert_eq!(
+            reread.elements[0].source_link(),
+            Some("https://www.pinterest.com/pin/123456789/")
+        );
+
+        let mut unsafe_element = reread.elements[0].clone();
+        unsafe_element.source_url = Some("javascript:alert(1)".into());
+        assert_eq!(unsafe_element.source_link(), None);
+        unsafe_element.source_url = Some("https://user@example.com/pin".into());
+        assert_eq!(unsafe_element.source_link(), None);
+        unsafe_element.source_url = Some("https://example.com:bad/pin".into());
+        assert_eq!(unsafe_element.source_link(), None);
     }
 
     #[test]

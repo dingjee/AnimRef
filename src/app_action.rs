@@ -16,6 +16,7 @@ pub enum AppAction {
     SendBackward,
     AddText,
     PrepareYoutube { url: String, target_id: Option<u64> },
+    OpenSourceLink(String),
     ToggleGrid,
     CenterView,
     FitView,
