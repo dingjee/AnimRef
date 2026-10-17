@@ -5,6 +5,7 @@ pub enum AppAction {
     NewScene,
     OpenScene,
     OpenRecent(PathBuf),
+    ClearRecent,
     Save,
     SaveAs,
     ImportMedia,

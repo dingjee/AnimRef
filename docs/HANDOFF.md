@@ -13,6 +13,8 @@
 - 画布不保留顶部菜单、属性栏和状态栏；窗口标题及控制按钮在顶部悬停时显示，主要动作通过右键菜单和快捷键完成。
 - 复制仅写入系统剪贴板；导出保留图片、GIF 或视频的实际媒体格式。暂停状态、当前播放位置、原始来源链接及点阵网格吸附设置随场景保存。媒体右键菜单可用系统默认浏览器打开原始来源。
 - 保留无边框置顶窗口及常用快捷键；快捷键详见根目录 Readme。
+- New / Ctrl+N 打开空白新窗口，当前窗口及场景保留。Recent 底部可清除历史路径；不删除场景文件。Center view 根据所有项目的外接边界居中，保留缩放比例。
+- Add text 直接进入画布内文字编辑；双击已有文字继续编辑。下方工具条提供左/中/右对齐、斐波那契字号、粗体和斜体。Esc 或点击外部结束并保留文字，编辑时可 Ctrl+S 保存；样式写入 `.purgif`。
 - 可读取旧 `.purgif`，保留画布变换、元素顺序、中文/多行文字和循环区间。旧版编辑视频状态恢复为正常画布视图。
 - YouTube 先读取元数据，填写原视频起止时间，点击下载后请求该区间；原链接、原时长、区间和缓存路径写入场景。网络分片/关键帧可能带来少量相邻数据读取。
 - `.purgif` 不打包外部媒体。移动场景时需保留对应文件；换机器或清空缓存后，YouTube 片段可重新选择下载。
@@ -29,6 +31,6 @@ cargo clippy --locked --all-targets -- -D warnings
 ./scripts/package-windows.ps1
 ```
 
-准确版本见 [环境记录](ENVIRONMENT.md)。原迁移的测试结果见 [迁移验收记录](ACCEPTANCE.md)，界面及播放系统调整见 [修订验收记录](REVISION_ACCEPTANCE.md)，最新 2.1.1 结果见 [UI 与 Pinterest 验收](UI_POLISH_ACCEPTANCE.md)。`target/acceptance` 中的合成场景、运行报告与诊断图片用于本机复验；生成物和 `dist` 均不纳入 Git。
+准确版本见 [环境记录](ENVIRONMENT.md)。最新 2.2.0 结果见 [画布文字与窗口验收](CANVAS_EDIT_ACCEPTANCE.md)。原迁移的测试结果见 [迁移验收记录](ACCEPTANCE.md)，早期界面及播放系统调整见 [修订验收记录](REVISION_ACCEPTANCE.md)，2.1.1 结果见 [UI 与 Pinterest 验收](UI_POLISH_ACCEPTANCE.md)。`target/acceptance` 中的合成场景、运行报告与诊断图片用于本机复验；生成物和 `dist` 均不纳入 Git。
 
 最终提交可通过 `git log -1 --oneline` 查看。本次只提交本地仓库，未推送远程。

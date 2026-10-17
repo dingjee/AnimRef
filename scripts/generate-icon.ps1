@@ -1,54 +1,99 @@
-Add-Type -AssemblyName System.Drawing
-
-function New-IconBitmap([int]$Size) {
-    $bitmap = New-Object System.Drawing.Bitmap $Size, $Size
-    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-    $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $graphics.Clear([System.Drawing.Color]::Transparent)
-    $scale = $Size / 64.0
-    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $radius = 13.0 * $scale
-    $diameter = 2.0 * $radius
-    $bounds = New-Object System.Drawing.RectangleF ([single](5*$scale)), ([single](5*$scale)), ([single](54*$scale)), ([single](54*$scale))
-    $path.AddArc($bounds.X, $bounds.Y, $diameter, $diameter, 180, 90)
-    $path.AddArc($bounds.Right-$diameter, $bounds.Y, $diameter, $diameter, 270, 90)
-    $path.AddArc($bounds.Right-$diameter, $bounds.Bottom-$diameter, $diameter, $diameter, 0, 90)
-    $path.AddArc($bounds.X, $bounds.Bottom-$diameter, $diameter, $diameter, 90, 90)
-    $path.CloseFigure()
-    $background = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255,30,34,43))
-    $graphics.FillPath($background, $path)
-    $cyan = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255,64,196,220)), ([single](3*$scale))
-    $inset = 14.0 * $scale
-    $side = 36.0 * $scale
-    $graphics.DrawRectangle($cyan, [single]$inset, [single]$inset, [single]$side, [single]$side)
-    $play = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255,245,248,252))
-    $points = [System.Drawing.PointF[]]::new(3)
-    $points[0] = [System.Drawing.PointF]::new([single](27*$scale), [single](22*$scale))
-    $points[1] = [System.Drawing.PointF]::new([single](27*$scale), [single](42*$scale))
-    $points[2] = [System.Drawing.PointF]::new([single](44*$scale), [single](32*$scale))
-    $graphics.FillPolygon($play, $points)
-    $graphics.Dispose()
-    $path.Dispose(); $background.Dispose(); $cyan.Dispose(); $play.Dispose()
-    return $bitmap
-}
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName WindowsBase
 
 $root = Split-Path -Parent $PSScriptRoot
+$svgPath = Join-Path $root 'assets/animref.svg'
+[xml]$svg = Get-Content -Raw $svgPath
+$viewBox = $svg.DocumentElement.GetAttribute('viewBox').Split(' ')
+$sourceWidth = [double]$viewBox[2]
+$sourceHeight = [double]$viewBox[3]
+
+$gradientNode = $svg.SelectSingleNode("//*[local-name()='linearGradient']")
+if (-not $gradientNode) { throw 'The icon SVG needs a linearGradient.' }
+$gradientBrush = New-Object System.Windows.Media.LinearGradientBrush
+$gradientBrush.StartPoint = [System.Windows.Point]::new([double]$gradientNode.GetAttribute('x1'), [double]$gradientNode.GetAttribute('y1'))
+$gradientBrush.EndPoint = [System.Windows.Point]::new([double]$gradientNode.GetAttribute('x2'), [double]$gradientNode.GetAttribute('y2'))
+$gradientBrush.MappingMode = [System.Windows.Media.BrushMappingMode]::Absolute
+foreach ($stop in $gradientNode.SelectNodes("*[local-name()='stop']")) {
+    $offset = [double]$stop.GetAttribute('offset')
+    $colorText = $stop.GetAttribute('stop-color').TrimStart('#')
+    $color = [System.Windows.Media.Color]::FromRgb(
+        [Convert]::ToByte($colorText.Substring(0, 2), 16),
+        [Convert]::ToByte($colorText.Substring(2, 2), 16),
+        [Convert]::ToByte($colorText.Substring(4, 2), 16))
+    $gradientBrush.GradientStops.Add([System.Windows.Media.GradientStop]::new($color, $offset))
+}
+
+$strokeGroup = $svg.SelectSingleNode("//*[local-name()='g' and @stroke]")
+$strokeWidth = [double]$strokeGroup.GetAttribute('stroke-width')
+$pen = New-Object System.Windows.Media.Pen($gradientBrush, $strokeWidth)
+$pen.StartLineCap = [System.Windows.Media.PenLineCap]::Round
+$pen.EndLineCap = [System.Windows.Media.PenLineCap]::Round
+$pen.LineJoin = [System.Windows.Media.PenLineJoin]::Round
+
+function Convert-SvgGeometry($node) {
+    switch ($node.LocalName) {
+        'path' { return [System.Windows.Media.Geometry]::Parse($node.GetAttribute('d')) }
+        'circle' {
+            $cx = [double]$node.GetAttribute('cx')
+            $cy = [double]$node.GetAttribute('cy')
+            $r = [double]$node.GetAttribute('r')
+            return [System.Windows.Media.EllipseGeometry]::new([System.Windows.Point]::new($cx, $cy), $r, $r)
+        }
+        default { throw "Unsupported SVG geometry: $($node.LocalName)" }
+    }
+}
+
+$geometries = @()
+foreach ($node in $strokeGroup.ChildNodes) {
+    if ($node.NodeType -eq [System.Xml.XmlNodeType]::Element) {
+        $geometries += ,(Convert-SvgGeometry $node)
+    }
+}
+
+function New-IconPng([int]$Size) {
+    $supersample = 4
+    $largeSize = $Size * $supersample
+    $largeVisual = New-Object System.Windows.Media.DrawingVisual
+    $largeContext = $largeVisual.RenderOpen()
+    $largeContext.PushTransform([System.Windows.Media.ScaleTransform]::new($largeSize / $sourceWidth, $largeSize / $sourceHeight))
+    foreach ($geometry in $geometries) { $largeContext.DrawGeometry($null, $pen, $geometry) }
+    $largeContext.Pop()
+    $largeContext.Close()
+    $largeBitmap = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($largeSize, $largeSize, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $largeBitmap.Render($largeVisual)
+
+    $smallVisual = New-Object System.Windows.Media.DrawingVisual
+    [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($smallVisual, [System.Windows.Media.BitmapScalingMode]::Fant)
+    $smallContext = $smallVisual.RenderOpen()
+    $smallContext.DrawImage($largeBitmap, [System.Windows.Rect]::new(0, 0, $Size, $Size))
+    $smallContext.Close()
+    $bitmap = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($Size, $Size, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $bitmap.Render($smallVisual)
+
+    $encoder = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+    $encoder.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bitmap))
+    $stream = New-Object System.IO.MemoryStream
+    $encoder.Save($stream)
+    $bytes = $stream.ToArray()
+    $stream.Dispose()
+    return ,$bytes
+}
+
 $sizes = @(16, 32, 48, 64, 256)
 $images = @()
 foreach ($size in $sizes) {
-    $bitmap = New-IconBitmap $size
-    $stream = New-Object System.IO.MemoryStream
-    $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-    $images += ,@($size, $stream.ToArray())
-    if ($size -eq 64) { $bitmap.Save((Join-Path $root 'assets/animref.png'), [System.Drawing.Imaging.ImageFormat]::Png) }
-    $stream.Dispose(); $bitmap.Dispose()
+    $bytes = New-IconPng $size
+    $images += ,@($size, [byte[]]$bytes)
+    if ($size -eq 256) { [IO.File]::WriteAllBytes((Join-Path $root 'assets/animref.png'), [byte[]]$bytes) }
 }
 
 # Windows shell supports PNG-compressed icon images in the ICO container.
 $directoryLength = 6 + 16 * $images.Count
 $offset = $directoryLength
 $output = New-Object System.IO.MemoryStream
-$writer = New-Object System.IO.BinaryWriter $output
+$writer = New-Object System.IO.BinaryWriter($output)
 $writer.Write([uint16]0); $writer.Write([uint16]1); $writer.Write([uint16]$images.Count)
 foreach ($image in $images) {
     $size = [int]$image[0]; $bytes = [byte[]]$image[1]

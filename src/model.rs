@@ -224,6 +224,85 @@ pub struct Element {
     pub active_playback_loop_pair: Option<usize>,
     #[serde(default, rename = "playbackState")]
     pub playback_state: PlaybackState,
+    #[serde(default, rename = "textStyle", skip_serializing_if = "Option::is_none")]
+    pub text_style: Option<TextStyle>,
+}
+
+/// Persistent formatting for newly styled canvas text. `None` keeps legacy text
+/// on its original auto-fit rendering path.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextStyle {
+    #[serde(default = "default_text_font_size")]
+    pub font_size: f32,
+    #[serde(default)]
+    pub alignment: TextAlignment,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextAlignment {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+const TEXT_FONT_STEPS: [f32; 14] = [
+    1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0, 144.0, 233.0, 377.0, 610.0,
+];
+
+fn default_text_font_size() -> f32 {
+    21.0
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self {
+            font_size: default_text_font_size(),
+            alignment: TextAlignment::Left,
+            bold: false,
+            italic: false,
+        }
+    }
+}
+
+impl TextStyle {
+    /// Repair invalid persisted sizes into the supported Fibonacci range.
+    pub fn normalize(&mut self) {
+        if !self.font_size.is_finite() || self.font_size <= 0.0 {
+            self.font_size = default_text_font_size();
+        }
+        self.font_size = self
+            .font_size
+            .clamp(TEXT_FONT_STEPS[0], *TEXT_FONT_STEPS.last().unwrap());
+    }
+
+    /// Move to the next Fibonacci size. Arbitrary legacy sizes step to the
+    /// nearest strictly larger/smaller supported value.
+    pub fn step_font_size(&mut self, direction: i32) {
+        self.normalize();
+        if direction > 0 {
+            if let Some(next) = TEXT_FONT_STEPS
+                .iter()
+                .copied()
+                .find(|size| *size > self.font_size)
+            {
+                self.font_size = next;
+            }
+        } else if direction < 0
+            && let Some(previous) = TEXT_FONT_STEPS
+                .iter()
+                .rev()
+                .copied()
+                .find(|size| *size < self.font_size)
+        {
+            self.font_size = previous;
+        }
+    }
 }
 
 impl Element {
@@ -265,6 +344,7 @@ impl Element {
             playback_loop_pairs: Vec::new(),
             active_playback_loop_pair: None,
             playback_state: PlaybackState::default(),
+            text_style: None,
         }
     }
 
@@ -425,6 +505,9 @@ impl Scene {
         }
         let mut seen_ids = std::collections::HashSet::new();
         for element in &mut scene.elements {
+            if let Some(style) = &mut element.text_style {
+                style.normalize();
+            }
             if !element.playback_state.position_seconds.is_finite()
                 || element.playback_state.position_seconds < 0.0
             {

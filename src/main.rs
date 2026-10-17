@@ -4,6 +4,7 @@ mod app_action;
 mod dialog_coordinator;
 mod icon;
 mod window_host;
+use animref::text_item::{self, TextEditorState};
 
 use animref::{asset_io, media, model, pinterest, youtube};
 use anyhow::{Context, Result};
@@ -71,6 +72,7 @@ struct CliOptions {
     quit_after_smoke: bool,
     ui_scenario: UiScenario,
     window_size: Option<[f32; 2]>,
+    new_window: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -78,6 +80,7 @@ enum UiScenario {
     #[default]
     Clean,
     Title,
+    TitleUnpinned,
     Menu,
     Playback,
     Youtube,
@@ -87,6 +90,9 @@ enum UiScenario {
     RecentMenu,
     Toast,
     Resize,
+    TextEdit,
+    TextStyled,
+    MenuLeft,
 }
 
 impl CliOptions {
@@ -98,10 +104,15 @@ impl CliOptions {
                 options.quit_after_smoke = true;
                 continue;
             }
+            if arg == "--new-window" {
+                options.new_window = true;
+                continue;
+            }
             if arg == "--ui-scenario" {
                 if let Some(value) = args.next() {
                     options.ui_scenario = match value.to_string_lossy().as_ref() {
                         "title" => UiScenario::Title,
+                        "title-unpinned" => UiScenario::TitleUnpinned,
                         "menu" => UiScenario::Menu,
                         "playback" => UiScenario::Playback,
                         "youtube" => UiScenario::Youtube,
@@ -111,6 +122,9 @@ impl CliOptions {
                         "recent-menu" => UiScenario::RecentMenu,
                         "toast" => UiScenario::Toast,
                         "resize" => UiScenario::Resize,
+                        "text-edit" => UiScenario::TextEdit,
+                        "text-styled" => UiScenario::TextStyled,
+                        "menu-left" => UiScenario::MenuLeft,
                         _ => UiScenario::Clean,
                     };
                 }
@@ -192,8 +206,8 @@ struct AnimRefApp {
     status: String,
     always_on_top: bool,
     show_youtube: Option<YoutubeDialog>,
-    show_text_dialog: bool,
-    text_draft: String,
+    text_editor: TextEditorState,
+    editor_blocked_rects: Vec<Rect>,
     image_assets: HashMap<String, TextureHandle>,
     image_errors: HashMap<String, String>,
     remote_jobs: Vec<crossbeam_channel::Receiver<RemoteImageResult>>,
@@ -213,15 +227,19 @@ struct AnimRefApp {
     diagnostic_modifiers: String,
     diagnostic_wants_keyboard: bool,
     actions: VecDeque<AppAction>,
+    canvas_input_suppressed_frame: Option<u64>,
     dialogs: DialogCoordinator,
     toast: Option<(String, Instant)>,
     context_menu_pos: Option<Pos2>,
+    context_menu_opened_frame: u64,
     context_menu_item: bool,
     context_submenu: Option<&'static str>,
     context_submenu_anchor: Option<Rect>,
     diagnostic_menu_rect: Option<Rect>,
     diagnostic_transport_rect: Option<Rect>,
     diagnostic_header_rect: Option<Rect>,
+    diagnostic_header_buttons_rect: Option<Rect>,
+    header_interactive_rects: Vec<Rect>,
     diagnostic_toast_rect: Option<Rect>,
     resize_hovered: bool,
     hovered_header: bool,
@@ -253,8 +271,8 @@ impl AnimRefApp {
             status: String::new(),
             always_on_top: true,
             show_youtube: None,
-            show_text_dialog: false,
-            text_draft: String::new(),
+            text_editor: TextEditorState::default(),
+            editor_blocked_rects: Vec::new(),
             image_assets: HashMap::new(),
             image_errors: HashMap::new(),
             remote_jobs: Vec::new(),
@@ -274,15 +292,19 @@ impl AnimRefApp {
             diagnostic_modifiers: String::new(),
             diagnostic_wants_keyboard: false,
             actions: VecDeque::new(),
+            canvas_input_suppressed_frame: None,
             dialogs: DialogCoordinator::default(),
             toast: None,
             context_menu_pos: None,
+            context_menu_opened_frame: 0,
             context_menu_item: false,
             context_submenu: None,
             context_submenu_anchor: None,
             diagnostic_menu_rect: None,
             diagnostic_transport_rect: None,
             diagnostic_header_rect: None,
+            diagnostic_header_buttons_rect: None,
+            header_interactive_rects: Vec::new(),
             diagnostic_toast_rect: None,
             resize_hovered: false,
             hovered_header: false,
@@ -304,7 +326,9 @@ impl AnimRefApp {
                 app.status = format!("Could not load {}: {error:#}", scene_path.display());
                 eprintln!("AnimRef smoke scene load failed: {error:#}");
             }
-        } else if let Some(last) = app.recent.last().cloned() {
+        } else if !app.cli.new_window
+            && let Some(last) = app.recent.last().cloned()
+        {
             let _ = app.load_scene(&last);
         }
         match app.cli.ui_scenario {
@@ -325,6 +349,12 @@ impl AnimRefApp {
             }
             UiScenario::Menu => app.context_menu_pos = Some(Pos2::new(24.0, 58.0)),
             UiScenario::Title => app.hovered_header = true,
+            UiScenario::TitleUnpinned => {
+                app.always_on_top = false;
+                cc.egui_ctx
+                    .send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
+                app.hovered_header = true;
+            }
             UiScenario::Grid => app.scene.grid.enabled = true,
             UiScenario::ItemMenu => {
                 app.selected = app.scene.elements.len().checked_sub(1);
@@ -342,6 +372,9 @@ impl AnimRefApp {
             UiScenario::Toast => app.status = "Changes saved successfully".into(),
             UiScenario::Resize => app.selected = (!app.scene.elements.is_empty()).then_some(0),
             UiScenario::Playback => app.playback_scenario_pending = true,
+            UiScenario::TextEdit => app.actions.push_back(AppAction::AddText),
+            UiScenario::TextStyled => app.add_diagnostic_styled_text(),
+            UiScenario::MenuLeft => app.open_diagnostic_left_item_menu(),
             UiScenario::Clean => {}
         }
         app
@@ -394,6 +427,8 @@ impl AnimRefApp {
 
     fn load_scene(&mut self, path: &Path) -> Result<()> {
         self.show_youtube = None;
+        self.text_editor.finish();
+        self.editor_blocked_rects.clear();
         self.cancel_pinterest_jobs();
         self.scene_generation = self.scene_generation.wrapping_add(1);
         let scene_path = if path.is_absolute() {
@@ -481,15 +516,8 @@ impl AnimRefApp {
         store_recent(&self.recent);
     }
 
-    fn new_scene(&mut self) {
-        self.show_youtube = None;
-        self.cancel_pinterest_jobs();
-        self.scene_generation = self.scene_generation.wrapping_add(1);
-        self.scene = Scene::default();
-        self.scene_path = None;
-        self.selected = None;
-        self.clear_media_caches();
-        self.status = "New scene".into();
+    fn refresh_recent(&mut self) {
+        self.recent = load_recent();
     }
 
     fn clear_media_caches(&mut self) {
@@ -557,6 +585,90 @@ impl AnimRefApp {
         let element = Element::new(text.clone(), "text", 160.0, 140.0, 360.0, 70.0);
         self.scene.elements.push(element);
         self.selected = self.scene.elements.len().checked_sub(1);
+    }
+
+    fn add_text_at_view_center(&mut self, viewport: Rect) {
+        let width = (viewport.width() - 32.0).clamp(100.0, 360.0);
+        let height = (viewport.height() - 32.0).clamp(64.0, 90.0);
+        let scale = self.scene.current_scale.max(0.01);
+        let center = (viewport.size() * 0.5
+            - Vec2::new(self.scene.translate.x, self.scene.translate.y))
+            / scale;
+        let mut element = Element::new(
+            String::new(),
+            "text",
+            center.x - width * 0.5,
+            center.y - height * 0.5,
+            width,
+            height,
+        );
+        element.text_style = Some(model::TextStyle::default());
+        self.scene.elements.push(element);
+        self.selected = self.scene.elements.len().checked_sub(1);
+        self.text_editor
+            .begin(self.scene.elements.last_mut().unwrap());
+    }
+
+    fn add_diagnostic_styled_text(&mut self) {
+        let width = 360.0_f32.min(self.cli.window_size.map_or(900.0, |size| size[0]) - 32.0);
+        let height = 240.0_f32.min(self.cli.window_size.map_or(650.0, |size| size[1]) - 32.0);
+        let viewport = Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(
+                self.cli.window_size.map_or(900.0, |size| size[0]),
+                self.cli.window_size.map_or(650.0, |size| size[1]),
+            ),
+        );
+        let scale = self.scene.current_scale.max(0.01);
+        let center = (viewport.size() * 0.5
+            - Vec2::new(self.scene.translate.x, self.scene.translate.y))
+            / scale;
+        let mut element = Element::new(
+            "Styled text\n中文 English\nCenter aligned".into(),
+            "text",
+            center.x - width * 0.5,
+            center.y - height * 0.5,
+            width,
+            height,
+        );
+        element.text_style = Some(model::TextStyle {
+            font_size: 34.0,
+            alignment: model::TextAlignment::Center,
+            bold: true,
+            italic: true,
+        });
+        self.scene.elements.push(element);
+        self.selected = self.scene.elements.len().checked_sub(1);
+    }
+
+    fn open_diagnostic_left_item_menu(&mut self) {
+        let viewport = Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(
+                self.cli.window_size.map_or(900.0, |size| size[0]),
+                self.cli.window_size.map_or(650.0, |size| size[1]),
+            ),
+        );
+        let target = self
+            .scene
+            .elements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| {
+                let visible =
+                    element_screen_rect(viewport, &self.scene, element).intersect(viewport);
+                (!visible.is_negative() && visible.is_positive()).then_some((index, visible))
+            })
+            .min_by(|(_, left), (_, right)| left.left().total_cmp(&right.left()));
+        if let Some((index, rect)) = target {
+            let point = Pos2::new((rect.left() + 8.0).min(rect.right() - 1.0), rect.center().y);
+            self.selected = Some(index);
+            self.context_menu_pos = Some(point);
+            self.context_menu_item = true;
+        } else {
+            self.context_menu_pos = Some(Pos2::new(24.0, 58.0));
+            self.context_menu_item = false;
+        }
     }
 
     fn handle_paste(&mut self) {
@@ -1143,6 +1255,7 @@ impl AnimRefApp {
 
     fn queue_action(&mut self, action: AppAction) {
         self.actions.push_back(action);
+        self.canvas_input_suppressed_frame = Some(self.update_count.saturating_add(1));
         self.context_menu_pos = None;
         self.context_menu_item = false;
         self.context_submenu = None;
@@ -1152,7 +1265,15 @@ impl AnimRefApp {
     fn run_actions(&mut self, ctx: &EguiContext) {
         while let Some(action) = self.actions.pop_front() {
             match action {
-                AppAction::NewScene => self.new_scene(),
+                AppAction::NewScene => {
+                    if let Err(error) = open_new_window() {
+                        self.status = format!("Could not open a new window: {error:#}");
+                    }
+                }
+                AppAction::ClearRecent => {
+                    self.recent.clear();
+                    store_recent(&self.recent);
+                }
                 AppAction::OpenScene => self.dialogs.enqueue(DialogRequest::OpenScene),
                 AppAction::OpenRecent(path) => {
                     let result = self.load_scene(&path);
@@ -1173,7 +1294,20 @@ impl AnimRefApp {
                 AppAction::DeleteSelected => self.delete_selected(),
                 AppAction::BringForward => self.move_selected_layer(1),
                 AppAction::SendBackward => self.move_selected_layer(-1),
-                AppAction::AddText => self.show_text_dialog = true,
+                AppAction::AddText => {
+                    self.add_text_at_view_center(ctx.screen_rect());
+                    if self.cli.ui_scenario == UiScenario::TextEdit {
+                        let index = self.selected;
+                        self.text_editor.finish();
+                        if let Some(element) =
+                            index.and_then(|index| self.scene.elements.get_mut(index))
+                        {
+                            element.path =
+                                "AnimRef — text editing\n你好，参考画布\nLatin and 中文".into();
+                            self.text_editor.begin(element);
+                        }
+                    }
+                }
                 AppAction::PrepareYoutube { url, target_id } => {
                     self.start_youtube_metadata(url, target_id)
                 }
@@ -1185,7 +1319,7 @@ impl AnimRefApp {
                 AppAction::ToggleGrid => {
                     self.scene.grid.enabled = !self.scene.grid.enabled;
                 }
-                AppAction::CenterView => self.scene.translate = model::Translate::default(),
+                AppAction::CenterView => center_view(&mut self.scene, ctx.screen_rect()),
                 AppAction::FitView => self.fit_scene(ctx),
                 AppAction::SetLoopStart => self.set_loop_boundary(true),
                 AppAction::SetLoopEnd => self.set_loop_boundary(false),
@@ -1243,6 +1377,10 @@ impl AnimRefApp {
             .filter(|index| *index < self.scene.elements.len())
         {
             let removed = self.scene.elements.remove(index);
+            if self.text_editor.editing_id == Some(removed.id) {
+                self.text_editor.finish();
+                self.editor_blocked_rects.clear();
+            }
             self.clear_item_cache(removed.id);
         }
     }
@@ -1530,9 +1668,13 @@ impl AnimRefApp {
 
     fn draw_hover_header(&mut self, ctx: &EguiContext) {
         self.diagnostic_header_rect = None;
+        self.diagnostic_header_buttons_rect = None;
+        self.header_interactive_rects.clear();
         let pointer = ctx.input(|input| input.pointer.hover_pos());
-        let show =
-            self.cli.ui_scenario == UiScenario::Title || pointer.is_some_and(|pos| pos.y <= 42.0);
+        let show = matches!(
+            self.cli.ui_scenario,
+            UiScenario::Title | UiScenario::TitleUnpinned
+        ) || pointer.is_some_and(|pos| pos.y <= 42.0);
         self.hovered_header = show;
         if !show {
             return;
@@ -1554,9 +1696,11 @@ impl AnimRefApp {
                     .show(ui, |ui| {
                         ui.set_width((width - 20.0).max(200.0));
                         ui.horizontal(|ui| {
-                            let title_width = (ui.available_width() - 132.0).max(56.0);
+                            let controls_width = 4.0 * 28.0 + 3.0 * ui.spacing().item_spacing.x;
+                            let title_width = (ui.available_width() - controls_width).max(0.0);
                             let (title_rect, drag) =
                                 ui.allocate_exact_size(Vec2::new(title_width, 25.0), Sense::drag());
+                            self.header_interactive_rects.push(title_rect);
                             let drag = drag.on_hover_text(
                                 self.scene_path
                                     .as_ref()
@@ -1592,34 +1736,37 @@ impl AnimRefApp {
                             if drag.dragged() {
                                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                             }
-                            let pin = icon_button(
+                            let pin = icon_button_with_font(
                                 ui,
                                 if self.always_on_top {
-                                    egui_phosphor::regular::PUSH_PIN
+                                    egui_phosphor::fill::PUSH_PIN
                                 } else {
-                                    egui_phosphor::regular::PUSH_PIN_SIMPLE
+                                    egui_phosphor::regular::PUSH_PIN
                                 },
                                 if self.always_on_top {
                                     "Always on top (enabled)"
                                 } else {
                                     "Always on top (disabled)"
                                 },
-                            )
-                            .on_hover_text(if self.always_on_top {
-                                "Always on top (enabled)"
-                            } else {
-                                "Always on top (disabled)"
-                            });
+                                if self.always_on_top {
+                                    phosphor_fill_font(16.0)
+                                } else {
+                                    phosphor_font(16.0)
+                                },
+                            );
+                            self.header_interactive_rects.push(pin.rect);
                             if pin.clicked() {
                                 self.queue_action(AppAction::TogglePin);
                             }
-                            if icon_button(ui, egui_phosphor::regular::MINUS, "Minimize").clicked()
-                            {
+                            let minimize =
+                                icon_button(ui, egui_phosphor::regular::MINUS, "Minimize");
+                            self.header_interactive_rects.push(minimize.rect);
+                            if minimize.clicked() {
                                 self.queue_action(AppAction::Minimize);
                             }
                             let maximized =
                                 ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-                            if icon_button(
+                            let maximize = icon_button(
                                 ui,
                                 if maximized {
                                     egui_phosphor::regular::CORNERS_IN
@@ -1627,18 +1774,26 @@ impl AnimRefApp {
                                     egui_phosphor::regular::CORNERS_OUT
                                 },
                                 "Maximize / restore",
-                            )
-                            .clicked()
-                            {
+                            );
+                            self.header_interactive_rects.push(maximize.rect);
+                            if maximize.clicked() {
                                 self.queue_action(AppAction::ToggleMaximize);
                             }
-                            if icon_button(ui, egui_phosphor::regular::X, "Close").clicked() {
+                            let close = icon_button(ui, egui_phosphor::regular::X, "Close");
+                            self.header_interactive_rects.push(close.rect);
+                            if close.clicked() {
                                 self.queue_action(AppAction::Close);
                             }
                         });
                     });
             });
         self.diagnostic_header_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 40.0)));
+        self.diagnostic_header_buttons_rect = self
+            .header_interactive_rects
+            .iter()
+            .skip(1)
+            .copied()
+            .reduce(Rect::union);
     }
 
     fn draw_context_menu(&mut self, ctx: &EguiContext) {
@@ -1853,6 +2008,7 @@ impl AnimRefApp {
                                         }
                                     }
                                     "Recent" => {
+                                        self.refresh_recent();
                                         let paths = self.recent.clone();
                                         if paths.is_empty() {
                                             ui.label("No recent scenes");
@@ -1869,6 +2025,16 @@ impl AnimRefApp {
                                             {
                                                 action = Some(AppAction::OpenRecent(path));
                                             }
+                                        }
+                                        ui.separator();
+                                        if context_menu_row(
+                                            ui,
+                                            "Clear history",
+                                            !self.recent.is_empty(),
+                                        )
+                                        .clicked()
+                                        {
+                                            action = Some(AppAction::ClearRecent);
                                         }
                                     }
                                     "Window" => {
@@ -1901,7 +2067,8 @@ impl AnimRefApp {
             self.queue_action(action);
         }
         let pointer = ctx.input(|input| input.pointer.interact_pos());
-        let clicked_elsewhere = ctx.input(|input| input.pointer.any_click())
+        let clicked_elsewhere = self.context_menu_opened_frame < self.update_count
+            && ctx.input(|input| input.pointer.any_click())
             && pointer.is_some_and(|point| {
                 !menu_rect.contains(point) && !submenu_rect.is_some_and(|rect| rect.contains(point))
             });
@@ -2240,6 +2407,7 @@ impl AnimRefApp {
                     "y": element.y,
                     "width": element.width,
                     "height": element.height,
+                    "textStyle": element.text_style,
                     "sourceRange": element.source_range,
                     "sourceUrl": element.source_link(),
                     "mediaDuration": element.media_duration,
@@ -2255,7 +2423,7 @@ impl AnimRefApp {
         let report = serde_json::json!({
             "processId": std::process::id(),
             "scenePath": self.scene_path,
-            "uiScenario": match self.cli.ui_scenario { UiScenario::Clean => "clean", UiScenario::Title => "title", UiScenario::Menu => "menu", UiScenario::Playback => "playback", UiScenario::Youtube => "youtube", UiScenario::Grid => "grid", UiScenario::ItemMenu => "item-menu", UiScenario::WindowMenu => "window-menu", UiScenario::RecentMenu => "recent-menu", UiScenario::Toast => "toast", UiScenario::Resize => "resize" },
+            "uiScenario": match self.cli.ui_scenario { UiScenario::Clean => "clean", UiScenario::Title => "title", UiScenario::TitleUnpinned => "title-unpinned", UiScenario::Menu => "menu", UiScenario::Playback => "playback", UiScenario::Youtube => "youtube", UiScenario::Grid => "grid", UiScenario::ItemMenu => "item-menu", UiScenario::WindowMenu => "window-menu", UiScenario::RecentMenu => "recent-menu", UiScenario::Toast => "toast", UiScenario::Resize => "resize", UiScenario::TextEdit => "text-edit", UiScenario::TextStyled => "text-styled", UiScenario::MenuLeft => "menu-left" },
             "windowSize": self.cli.window_size,
             "actualViewportSize": [ctx.screen_rect().width(), ctx.screen_rect().height()],
             "pixelsPerPoint": ctx.pixels_per_point(),
@@ -2273,6 +2441,10 @@ impl AnimRefApp {
             "menuRect": rect_json(self.diagnostic_menu_rect),
             "transportRect": rect_json(self.diagnostic_transport_rect),
             "headerRect": rect_json(self.diagnostic_header_rect),
+            "headerButtonsRect": rect_json(self.diagnostic_header_buttons_rect),
+            "alwaysOnTop": self.always_on_top,
+            "textEditorId": self.text_editor.editing_id,
+            "textEditorRects": self.editor_blocked_rects.iter().map(|rect| rect_json(Some(*rect))).collect::<Vec<_>>(),
             "toastRect": rect_json(self.diagnostic_toast_rect),
             "resizeHovered": self.resize_hovered,
             "cursorIcon": ctx.output(|output| format!("{:?}", output.cursor_icon)),
@@ -2312,7 +2484,7 @@ impl AnimRefApp {
 
     fn draw_canvas_surface(&mut self, ctx: &EguiContext) {
         self.ensure_assets(ctx);
-        let modal_active = self.show_youtube.is_some() || self.show_text_dialog;
+        let modal_active = self.show_youtube.is_some();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::BLACK))
             .show(ctx, |ui| {
@@ -2323,7 +2495,13 @@ impl AnimRefApp {
                 self.resize_hovered = false;
                 let pointer = ctx.input(|input| input.pointer.interact_pos());
                 let overlay_blocks = modal_active
+                    || self.canvas_input_suppressed_frame == Some(self.update_count)
                     || self.context_menu_pos.is_some()
+                    || pointer.is_some_and(|position| {
+                        self.editor_blocked_rects
+                            .iter()
+                            .any(|rect| rect.contains(position))
+                    })
                     || pointer.is_some_and(|position| self.hovered_header && position.y <= 42.0)
                     || pointer.is_some_and(|position| {
                         self.selected
@@ -2356,23 +2534,17 @@ impl AnimRefApp {
                 });
                 let mut bring_front = None;
                 for index in 0..self.scene.elements.len() {
-                    let (world_x, world_y, width, height, id) = {
+                    let (width, height, id) = {
                         let element = &self.scene.elements[index];
                         (
-                            element.x,
-                            element.y,
                             element.width.unwrap_or(320.0),
                             element.height.unwrap_or(200.0),
                             element.id,
                         )
                     };
+                    let element = &self.scene.elements[index];
+                    let rect = element_screen_rect(canvas_rect, &self.scene, element);
                     let scale = self.scene.current_scale.max(0.01);
-                    let origin =
-                        canvas_rect.min + Vec2::new(self.scene.translate.x, self.scene.translate.y);
-                    let rect = Rect::from_min_size(
-                        origin + Vec2::new(world_x, world_y) * scale,
-                        Vec2::new(width, height) * scale,
-                    );
                     let response =
                         ui.interact(rect, ui.id().with(("element", id)), Sense::click_and_drag());
                     let selected = self.selected_id() == Some(id);
@@ -2394,6 +2566,13 @@ impl AnimRefApp {
                     if !overlay_blocks && response.clicked_by(egui::PointerButton::Primary) {
                         self.selected = Some(index);
                         bring_front = Some(id);
+                    }
+                    if !overlay_blocks
+                        && response.double_clicked_by(egui::PointerButton::Primary)
+                        && self.scene.elements[index].media_type == "text"
+                    {
+                        self.selected = Some(index);
+                        self.text_editor.begin(&mut self.scene.elements[index]);
                     }
                     if !overlay_blocks
                         && response.dragged_by(egui::PointerButton::Primary)
@@ -2452,7 +2631,12 @@ impl AnimRefApp {
                         element.width = Some(new_width);
                         element.height = Some((new_width / aspect).max(10.0));
                     }
-                    self.paint_element(&painter, index, rect);
+                    if should_paint_static_element(
+                        &self.scene.elements[index],
+                        self.text_editor.editing_id,
+                    ) {
+                        self.paint_element(&painter, index, rect);
+                    }
                     if selected {
                         painter.rect_stroke(
                             rect,
@@ -2498,6 +2682,7 @@ impl AnimRefApp {
                 {
                     self.selected = None;
                 }
+                self.text_editor.clear_if_not_selected(self.selected_id());
                 let pointer_in_canvas = pointer.is_some_and(|point| canvas_rect.contains(point));
                 if !overlay_blocks
                     && pointer_in_canvas
@@ -2581,6 +2766,10 @@ impl AnimRefApp {
     fn paint_element(&mut self, painter: &egui::Painter, index: usize, rect: Rect) {
         let element = &self.scene.elements[index];
         if element.media_type == "text" {
+            if element.text_style.is_some() {
+                text_item::paint_text(painter, element, rect, self.scene.current_scale);
+                return;
+            }
             let desired = (rect.height() / 2.2).clamp(0.01, 72.0);
             let mut low = 0.01_f32;
             let mut high = desired;
@@ -2927,27 +3116,53 @@ impl AnimRefApp {
         );
     }
 
-    fn draw_other_windows(&mut self, ctx: &EguiContext) {
-        if self.show_text_dialog {
-            egui::Window::new("Add text")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.text_edit_multiline(&mut self.text_draft);
-                    if ui.button("Add").clicked() {
-                        let draft = std::mem::take(&mut self.text_draft);
-                        self.add_text(draft);
-                        self.show_text_dialog = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.show_text_dialog = false;
-                    }
-                });
+    fn draw_text_editor(&mut self, ctx: &EguiContext) {
+        let Some(id) = self.text_editor.editing_id else {
+            self.editor_blocked_rects.clear();
+            return;
+        };
+        let Some(index) = self
+            .scene
+            .elements
+            .iter()
+            .position(|element| element.id == id)
+        else {
+            self.text_editor.finish();
+            self.editor_blocked_rects.clear();
+            return;
+        };
+        let screen = ctx.screen_rect();
+        let rect = element_screen_rect(screen, &self.scene, &self.scene.elements[index]);
+        let output = text_item::draw_editor(
+            ctx,
+            &mut self.text_editor,
+            &mut self.scene.elements[index],
+            rect,
+            screen,
+            self.scene.current_scale,
+        );
+        self.editor_blocked_rects = output.blocked_rects.clone();
+        if output.cancel_request {
+            self.text_editor.cancel(&mut self.scene.elements[index]);
+            self.editor_blocked_rects.clear();
+        } else if output.finish_request {
+            self.text_editor.finish();
+            self.editor_blocked_rects.clear();
         }
     }
 
     fn begin_window_resize(&self, ctx: &EguiContext) {
-        if self.show_youtube.is_some() || self.show_text_dialog || self.context_menu_pos.is_some() {
+        if self.show_youtube.is_some()
+            || self.context_menu_pos.is_some()
+            || self.editor_blocked_rects.iter().any(|rect| {
+                ctx.input(|input| {
+                    input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pos| rect.contains(pos))
+                })
+            })
+        {
             return;
         }
         let (rect, pointer, pressed) = ctx.input(|i| {
@@ -2960,29 +3175,38 @@ impl AnimRefApp {
         let (Some(window_rect), Some(pointer)) = (rect, pointer) else {
             return;
         };
-        if !pressed {
+        if self
+            .header_interactive_rects
+            .iter()
+            .any(|rect| rect.contains(pointer))
+            || self
+                .diagnostic_transport_rect
+                .is_some_and(|rect| rect.contains(pointer))
+            || self
+                .selected_item_handle_rect(ctx)
+                .is_some_and(|rect| rect.contains(pointer))
+        {
             return;
         }
         let rect = Rect::from_min_size(Pos2::ZERO, window_rect.size());
-        let edge = 6.0;
-        let left = pointer.x <= rect.left() + edge;
-        let right = pointer.x >= rect.right() - edge;
-        let top = pointer.y <= rect.top() + edge;
-        let bottom = pointer.y >= rect.bottom() - edge;
-        let direction = match (top, bottom, left, right) {
-            (true, _, true, _) => Some(egui::viewport::ResizeDirection::NorthWest),
-            (true, _, _, true) => Some(egui::viewport::ResizeDirection::NorthEast),
-            (_, true, true, _) => Some(egui::viewport::ResizeDirection::SouthWest),
-            (_, true, _, true) => Some(egui::viewport::ResizeDirection::SouthEast),
-            (true, _, _, _) => Some(egui::viewport::ResizeDirection::North),
-            (_, true, _, _) => Some(egui::viewport::ResizeDirection::South),
-            (_, _, true, _) => Some(egui::viewport::ResizeDirection::West),
-            (_, _, _, true) => Some(egui::viewport::ResizeDirection::East),
-            _ => None,
-        };
+        let direction = window_resize_direction(rect, pointer);
         if let Some(direction) = direction {
-            ctx.send_viewport_cmd(ViewportCommand::BeginResize(direction));
+            ctx.set_cursor_icon(resize_cursor(direction));
+            if pressed {
+                ctx.send_viewport_cmd(ViewportCommand::BeginResize(direction));
+            }
         }
+    }
+
+    fn selected_item_handle_rect(&self, ctx: &EguiContext) -> Option<Rect> {
+        let element = self
+            .selected
+            .and_then(|index| self.scene.elements.get(index))?;
+        let rect = element_screen_rect(ctx.screen_rect(), &self.scene, element);
+        Some(Rect::from_min_size(
+            rect.right_bottom() - Vec2::splat(12.0),
+            Vec2::splat(12.0),
+        ))
     }
 
     fn handle_shortcuts(&mut self, ctx: &EguiContext) {
@@ -3014,10 +3238,11 @@ impl AnimRefApp {
                 });
             }
         }
-        let save_as = !wants_keyboard && consume_ctrl_shortcut(ctx, Key::S, true);
+        let text_editing = self.text_editor.editing_id.is_some();
+        let save_as = (!wants_keyboard || text_editing) && consume_ctrl_shortcut(ctx, Key::S, true);
         if save_as {
             self.queue_action(AppAction::SaveAs);
-        } else if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::S, false) {
+        } else if (!wants_keyboard || text_editing) && consume_ctrl_shortcut(ctx, Key::S, false) {
             self.queue_action(AppAction::Save);
         }
         if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::L, false) {
@@ -3080,7 +3305,7 @@ impl eframe::App for AnimRefApp {
             )
         });
         let start_allowed = self.show_youtube.is_none()
-            && !self.show_text_dialog
+            && self.text_editor.editing_id.is_none()
             && self.context_menu_pos.is_none();
         if let Some(position) = self.window_host.update(
             frame,
@@ -3090,10 +3315,11 @@ impl eframe::App for AnimRefApp {
             local_position,
             start_allowed,
         ) && self.show_youtube.is_none()
-            && !self.show_text_dialog
+            && self.text_editor.editing_id.is_none()
         {
-            self.select_under_pointer(position);
+            self.select_under_pointer(position, ctx.screen_rect());
             self.context_menu_pos = Some(position);
+            self.context_menu_opened_frame = self.update_count;
             self.context_menu_item = self.selected_id().is_some();
             self.context_submenu = None;
         }
@@ -3111,7 +3337,7 @@ impl eframe::App for AnimRefApp {
         self.draw_selection_bar(ctx);
         self.draw_context_menu(ctx);
         self.draw_youtube_dialog(ctx);
-        self.draw_other_windows(ctx);
+        self.draw_text_editor(ctx);
         self.draw_toast(ctx);
         self.begin_window_resize(ctx);
         if self.smoke_report_written {
@@ -3122,18 +3348,10 @@ impl eframe::App for AnimRefApp {
 }
 
 impl AnimRefApp {
-    fn select_under_pointer(&mut self, pointer: Pos2) {
-        let origin = ctx_origin_for(&self.scene, pointer);
-        let scale = self.scene.current_scale.max(0.01);
+    fn select_under_pointer(&mut self, pointer: Pos2, viewport: Rect) {
         let mut selected = None;
         for (index, element) in self.scene.elements.iter().enumerate().rev() {
-            let rect = Rect::from_min_size(
-                origin + Vec2::new(element.x, element.y) * scale,
-                Vec2::new(
-                    element.width.unwrap_or(320.0),
-                    element.height.unwrap_or(200.0),
-                ) * scale,
-            );
+            let rect = element_screen_rect(viewport, &self.scene, element);
             if rect.contains(pointer) {
                 selected = Some(index);
                 break;
@@ -3143,9 +3361,92 @@ impl AnimRefApp {
     }
 }
 
-fn ctx_origin_for(scene: &Scene, pointer: Pos2) -> Pos2 {
-    let _ = pointer;
-    Pos2::ZERO + Vec2::new(scene.translate.x, scene.translate.y)
+fn element_screen_rect(viewport: Rect, scene: &Scene, element: &Element) -> Rect {
+    let scale = scene.current_scale.max(0.01);
+    let origin = viewport.min + Vec2::new(scene.translate.x, scene.translate.y);
+    Rect::from_min_size(
+        origin + Vec2::new(element.x, element.y) * scale,
+        Vec2::new(
+            element.width.unwrap_or(320.0),
+            element.height.unwrap_or(200.0),
+        ) * scale,
+    )
+}
+
+fn should_paint_static_element(element: &Element, editing_id: Option<u64>) -> bool {
+    element.media_type != "text" || editing_id != Some(element.id)
+}
+
+fn window_resize_direction(rect: Rect, pointer: Pos2) -> Option<egui::viewport::ResizeDirection> {
+    let edge = 6.0;
+    let left = pointer.x <= rect.left() + edge;
+    let right = pointer.x >= rect.right() - edge;
+    let top = pointer.y <= rect.top() + edge;
+    let bottom = pointer.y >= rect.bottom() - edge;
+    match (top, bottom, left, right) {
+        (true, _, true, _) => Some(egui::viewport::ResizeDirection::NorthWest),
+        (true, _, _, true) => Some(egui::viewport::ResizeDirection::NorthEast),
+        (_, true, true, _) => Some(egui::viewport::ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(egui::viewport::ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(egui::viewport::ResizeDirection::North),
+        (_, true, _, _) => Some(egui::viewport::ResizeDirection::South),
+        (_, _, true, _) => Some(egui::viewport::ResizeDirection::West),
+        (_, _, _, true) => Some(egui::viewport::ResizeDirection::East),
+        _ => None,
+    }
+}
+
+fn resize_cursor(direction: egui::viewport::ResizeDirection) -> egui::CursorIcon {
+    use egui::viewport::ResizeDirection as Direction;
+    match direction {
+        Direction::North | Direction::South => egui::CursorIcon::ResizeVertical,
+        Direction::East | Direction::West => egui::CursorIcon::ResizeHorizontal,
+        Direction::NorthWest | Direction::SouthEast => egui::CursorIcon::ResizeNwSe,
+        Direction::NorthEast | Direction::SouthWest => egui::CursorIcon::ResizeNeSw,
+    }
+}
+
+fn center_view(scene: &mut Scene, viewport: Rect) {
+    let Some((min, max)) = scene_bounds(scene) else {
+        scene.translate = model::Translate::default();
+        return;
+    };
+    let center = min + (max - min) * 0.5;
+    scene.translate.x = viewport.width() * 0.5 - center.x * scene.current_scale;
+    scene.translate.y = viewport.height() * 0.5 - center.y * scene.current_scale;
+}
+
+fn scene_bounds(scene: &Scene) -> Option<(Pos2, Pos2)> {
+    let first = scene.elements.first()?;
+    let mut min = Pos2::new(first.x, first.y);
+    let mut max = Pos2::new(
+        first.x + first.width.unwrap_or(320.0),
+        first.y + first.height.unwrap_or(200.0),
+    );
+    for element in scene.elements.iter().skip(1) {
+        min.x = min.x.min(element.x);
+        min.y = min.y.min(element.y);
+        max.x = max.x.max(element.x + element.width.unwrap_or(320.0));
+        max.y = max.y.max(element.y + element.height.unwrap_or(200.0));
+    }
+    Some((min, max))
+}
+
+fn open_new_window() -> Result<()> {
+    let executable = std::env::current_exe().context("locate AnimRef executable")?;
+    let mut command = std::process::Command::new(executable);
+    command.args(new_window_arguments());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command.spawn().context("open a new AnimRef window")?;
+    Ok(())
+}
+
+fn new_window_arguments() -> [&'static str; 1] {
+    ["--new-window"]
 }
 
 fn consume_ctrl_shortcut(ctx: &EguiContext, key: Key, shift: bool) -> bool {
@@ -3389,6 +3690,15 @@ fn context_menu_submenu_row(ui: &mut egui::Ui, label: &str, active: bool) -> egu
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
+    icon_button_with_font(ui, icon, tooltip, phosphor_font(16.0))
+}
+
+fn icon_button_with_font(
+    ui: &mut egui::Ui,
+    icon: &str,
+    tooltip: &str,
+    font: FontId,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::click());
     if response.hovered() || response.is_pointer_button_down_on() {
         ui.painter()
@@ -3398,7 +3708,7 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         icon,
-        phosphor_font(16.0),
+        font,
         ui.visuals().text_color(),
     );
     response.on_hover_text(tooltip)
@@ -3406,6 +3716,10 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
 
 fn phosphor_font(size: f32) -> FontId {
     FontId::proportional(size)
+}
+
+fn phosphor_fill_font(size: f32) -> FontId {
+    FontId::new(size, egui::FontFamily::Name("animref-phosphor-fill".into()))
 }
 
 fn remote_url_is_video(value: &str) -> bool {
@@ -3440,6 +3754,19 @@ fn clipboard_path(text: &str) -> Option<PathBuf> {
 fn install_cjk_font(ctx: &EguiContext) {
     let mut fonts = egui::FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    fonts.font_data.insert(
+        "animref-phosphor-fill".into(),
+        egui_phosphor::Variant::Fill.font_data().into(),
+    );
+    let fill_fallbacks = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    fonts.families.insert(
+        egui::FontFamily::Name("animref-phosphor-fill".into()),
+        [vec!["animref-phosphor-fill".into()], fill_fallbacks].concat(),
+    );
     for candidate in [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\simhei.ttf",
@@ -3458,6 +3785,7 @@ fn install_cjk_font(ctx: &EguiContext) {
             break;
         }
     }
+    text_item::install_text_fonts(&mut fonts);
     ctx.set_fonts(fonts);
 }
 
@@ -3588,8 +3916,8 @@ mod tests {
             status: String::new(),
             always_on_top: true,
             show_youtube: None,
-            show_text_dialog: false,
-            text_draft: String::new(),
+            text_editor: TextEditorState::default(),
+            editor_blocked_rects: Vec::new(),
             image_assets: HashMap::new(),
             image_errors: HashMap::new(),
             remote_jobs: Vec::new(),
@@ -3609,15 +3937,19 @@ mod tests {
             diagnostic_modifiers: String::new(),
             diagnostic_wants_keyboard: false,
             actions: VecDeque::new(),
+            canvas_input_suppressed_frame: None,
             dialogs: DialogCoordinator::default(),
             toast: None,
             context_menu_pos: None,
+            context_menu_opened_frame: 0,
             context_menu_item: false,
             context_submenu: None,
             context_submenu_anchor: None,
             diagnostic_menu_rect: None,
             diagnostic_transport_rect: None,
             diagnostic_header_rect: None,
+            diagnostic_header_buttons_rect: None,
+            header_interactive_rects: Vec::new(),
             diagnostic_toast_rect: None,
             resize_hovered: false,
             hovered_header: false,
@@ -3660,6 +3992,180 @@ mod tests {
         assert_eq!(parse_time("01:33.5"), Some(93.5));
         assert_eq!(parse_time("00:01:33.500"), Some(93.5));
         assert_eq!(parse_time("1:2:3:4"), None);
+    }
+
+    #[test]
+    fn new_window_cli_starts_empty_and_action_passes_only_new_window_flag() {
+        let parsed = CliOptions::parse(
+            new_window_arguments()
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert!(parsed.new_window);
+        assert!(parsed.scene_path.is_none());
+        assert_eq!(new_window_arguments(), ["--new-window"]);
+    }
+
+    #[test]
+    fn center_view_centers_all_element_bounds_without_changing_zoom() {
+        let mut scene = Scene {
+            current_scale: 0.75,
+            translate: model::Translate { x: -91.0, y: 214.0 },
+            ..Scene::default()
+        };
+        scene
+            .elements
+            .push(Element::new("a".into(), "text", -40.0, 20.0, 50.0, 80.0));
+        scene
+            .elements
+            .push(Element::new("b".into(), "text", 100.0, -30.0, 60.0, 40.0));
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+
+        center_view(&mut scene, viewport);
+
+        let (min, max) = scene_bounds(&scene).unwrap();
+        let bounds_center = min + (max - min) * 0.5;
+        let translated_center = Pos2::new(
+            scene.translate.x + bounds_center.x * scene.current_scale,
+            scene.translate.y + bounds_center.y * scene.current_scale,
+        );
+        assert_eq!(scene.current_scale, 0.75);
+        assert!((translated_center.x - viewport.center().x).abs() < 0.01);
+        assert!((translated_center.y - viewport.center().y).abs() < 0.01);
+    }
+
+    #[test]
+    fn transformed_item_hit_test_matches_canvas_bounds() {
+        let mut app = app_for_shortcut_test(PathBuf::new());
+        app.scene.current_scale = 1.5;
+        app.scene.translate = model::Translate { x: 20.0, y: -10.0 };
+        app.scene
+            .elements
+            .push(Element::new("item".into(), "text", 30.0, 50.0, 100.0, 40.0));
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let screen_rect = element_screen_rect(viewport, &app.scene, &app.scene.elements[0]);
+
+        app.select_under_pointer(screen_rect.center(), viewport);
+        assert_eq!(app.selected, Some(0));
+        app.select_under_pointer(Pos2::new(30.0, 30.0), viewport);
+        assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn add_text_starts_an_empty_editor_at_the_current_view_center() {
+        let mut app = app_for_shortcut_test(PathBuf::new());
+        app.scene.current_scale = 1.25;
+        app.scene.translate = model::Translate { x: 40.0, y: -30.0 };
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+
+        app.add_text_at_view_center(viewport);
+
+        let element = &app.scene.elements[app.selected.unwrap()];
+        let rect = element_screen_rect(viewport, &app.scene, element);
+        assert!(element.path.is_empty());
+        assert!(element.text_style.is_some());
+        assert_eq!(app.text_editor.editing_id, Some(element.id));
+        assert!((rect.center().x - viewport.center().x).abs() < 0.01);
+        assert!((rect.center().y - viewport.center().y).abs() < 0.01);
+    }
+
+    #[test]
+    fn active_text_editor_suppresses_only_its_static_text_paint() {
+        let text = Element::new("editing".into(), "text", 0.0, 0.0, 100.0, 50.0);
+        let image = Element::new("image.png".into(), "image", 0.0, 0.0, 100.0, 50.0);
+
+        assert!(!should_paint_static_element(&text, Some(text.id)));
+        assert!(should_paint_static_element(&text, None));
+        assert!(should_paint_static_element(
+            &text,
+            Some(text.id.wrapping_add(1))
+        ));
+        assert!(should_paint_static_element(&image, Some(image.id)));
+    }
+
+    #[test]
+    fn clearing_recent_history_persists_an_empty_list() {
+        let mut app = app_for_shortcut_test(PathBuf::new());
+        app.recent.push(PathBuf::from("sample.purgif"));
+        app.actions.push_back(AppAction::ClearRecent);
+        app.run_actions(&EguiContext::default());
+
+        assert!(app.recent.is_empty());
+        let saved = fs::read_to_string(recent_file()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<PathBuf>>(&saved).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        let mut other_window = app_for_shortcut_test(PathBuf::new());
+        other_window.recent.push(PathBuf::from("stale.purgif"));
+        other_window.refresh_recent();
+        assert!(other_window.recent.is_empty());
+    }
+
+    #[test]
+    fn window_resize_hit_test_covers_all_edges_and_corners() {
+        use egui::viewport::ResizeDirection as Direction;
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        for (point, expected) in [
+            (Pos2::new(400.0, 1.0), Direction::North),
+            (Pos2::new(400.0, 599.0), Direction::South),
+            (Pos2::new(1.0, 300.0), Direction::West),
+            (Pos2::new(799.0, 300.0), Direction::East),
+            (Pos2::new(1.0, 1.0), Direction::NorthWest),
+            (Pos2::new(799.0, 1.0), Direction::NorthEast),
+            (Pos2::new(1.0, 599.0), Direction::SouthWest),
+            (Pos2::new(799.0, 599.0), Direction::SouthEast),
+        ] {
+            assert_eq!(window_resize_direction(rect, point), Some(expected));
+        }
+        assert_eq!(window_resize_direction(rect, Pos2::new(400.0, 300.0)), None);
+    }
+
+    #[test]
+    fn context_menu_opening_click_survives_initial_popup_clamp() {
+        let context = EguiContext::default();
+        let mut app = app_for_shortcut_test(PathBuf::new());
+        app.context_menu_pos = Some(Pos2::new(400.0, 0.0));
+        app.context_menu_opened_frame = 5;
+        app.update_count = 5;
+        let screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)));
+        let point = Pos2::new(400.0, 0.0);
+        for (button, pressed) in [
+            (egui::PointerButton::Secondary, true),
+            (egui::PointerButton::Secondary, false),
+        ] {
+            let input = egui::RawInput {
+                screen_rect,
+                events: vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            };
+            let _ = context.run(input, |ctx| app.draw_context_menu(ctx));
+        }
+        assert!(app.context_menu_pos.is_some());
+
+        app.update_count += 1;
+        for pressed in [true, false] {
+            let input = egui::RawInput {
+                screen_rect,
+                events: vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            };
+            let _ = context.run(input, |ctx| app.draw_context_menu(ctx));
+        }
+        assert!(app.context_menu_pos.is_none());
     }
 
     #[test]

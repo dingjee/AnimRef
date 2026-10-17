@@ -45,7 +45,8 @@ impl WindowHost {
             {
                 let dx = screen.0 - gesture.screen_start.0;
                 let dy = screen.1 - gesture.screen_start.1;
-                if !gesture.moved && dx * dx + dy * dy >= 16 {
+                let (drag_x, drag_y) = system_drag_threshold();
+                if !gesture.moved && drag_threshold_crossed(dx, dy, drag_x, drag_y) {
                     gesture.moved = true;
                 }
                 if gesture.moved
@@ -85,6 +86,25 @@ impl WindowHost {
         }
         None
     }
+}
+
+fn drag_threshold_crossed(dx: i32, dy: i32, threshold_x: i32, threshold_y: i32) -> bool {
+    dx.unsigned_abs() >= threshold_x.max(1) as u32 || dy.unsigned_abs() >= threshold_y.max(1) as u32
+}
+
+#[cfg(windows)]
+fn system_drag_threshold() -> (i32, i32) {
+    let x = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows_sys::Win32::UI::WindowsAndMessaging::SM_CXDRAG,
+        )
+    };
+    let y = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows_sys::Win32::UI::WindowsAndMessaging::SM_CYDRAG,
+        )
+    };
+    (x.max(1), y.max(1))
 }
 
 #[cfg(windows)]
@@ -181,4 +201,17 @@ fn read_start(frame: &eframe::Frame) -> Option<((i32, i32), (i32, i32))> {
     };
     (unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) } != 0)
         .then_some((cursor, (rect.left, rect.top)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drag_threshold_crossed;
+
+    #[test]
+    fn right_drag_uses_system_threshold_on_each_physical_axis() {
+        assert!(!drag_threshold_crossed(3, 2, 4, 6));
+        assert!(drag_threshold_crossed(4, 0, 4, 6));
+        assert!(drag_threshold_crossed(0, 6, 4, 6));
+        assert!(drag_threshold_crossed(0, 1, 0, 1));
+    }
 }
