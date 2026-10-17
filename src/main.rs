@@ -1,18 +1,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod media;
-mod model;
-mod youtube;
+mod app_action;
+mod dialog_coordinator;
+mod icon;
+mod window_host;
 
+use animref::{asset_io, media, model, youtube};
 use anyhow::{Context, Result};
-use base64::Engine;
+use app_action::AppAction;
 #[cfg(windows)]
 use clipboard_win::Getter;
+use dialog_coordinator::{DialogCoordinator, DialogRequest, DialogResult};
 use eframe::egui::{
     self, Color32, ColorImage, Context as EguiContext, FontId, Key, Pos2, Rect, Sense, Stroke,
     TextureHandle, TextureOptions, Vec2, ViewportCommand, WindowLevel,
 };
-use image::{AnimationDecoder, GenericImageView};
+use image::GenericImageView;
 use model::{Element, Scene};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
@@ -20,7 +23,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use youtube::{DownloadEvent, DownloadJob, VideoMetadata};
+use youtube::{DownloadEvent, DownloadJob, DownloadProgress, DownloadStage, VideoMetadata};
 
 type RemoteImageSuccess = (u64, Option<u64>, String, PathBuf);
 type RemoteImageFailure = (u64, Option<u64>, String);
@@ -38,12 +41,14 @@ struct CompletedYoutubeDownload {
 
 fn main() -> eframe::Result<()> {
     let cli = CliOptions::parse(std::env::args_os().skip(1));
+    let size = cli.window_size.unwrap_or([900.0, 650.0]);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 650.0])
-            .with_min_inner_size([480.0, 320.0])
+            .with_inner_size(size)
+            .with_min_inner_size([320.0, 220.0])
             .with_decorations(false)
             .with_resizable(true)
+            .with_icon(crate::icon::viewport_icon())
             .with_title("AnimRef"),
         ..Default::default()
     };
@@ -64,6 +69,19 @@ struct CliOptions {
     screenshot_path: Option<PathBuf>,
     smoke_report_path: Option<PathBuf>,
     quit_after_smoke: bool,
+    ui_scenario: UiScenario,
+    window_size: Option<[f32; 2]>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum UiScenario {
+    #[default]
+    Clean,
+    Title,
+    Menu,
+    Playback,
+    Youtube,
+    Grid,
 }
 
 impl CliOptions {
@@ -73,6 +91,41 @@ impl CliOptions {
         while let Some(arg) = args.next() {
             if arg == "--quit-after-smoke" {
                 options.quit_after_smoke = true;
+                continue;
+            }
+            if arg == "--ui-scenario" {
+                if let Some(value) = args.next() {
+                    options.ui_scenario = match value.to_string_lossy().as_ref() {
+                        "title" => UiScenario::Title,
+                        "menu" => UiScenario::Menu,
+                        "playback" => UiScenario::Playback,
+                        "youtube" => UiScenario::Youtube,
+                        "grid" => UiScenario::Grid,
+                        _ => UiScenario::Clean,
+                    };
+                }
+                continue;
+            }
+            if arg == "--window-size" {
+                let value = args.next();
+                if let Some(value) = value.as_ref()
+                    && let Some((width, height)) = value.to_string_lossy().split_once('x')
+                    && let (Ok(width), Ok(height)) = (width.parse::<f32>(), height.parse::<f32>())
+                    && width >= 320.0
+                    && height >= 220.0
+                    && width.is_finite()
+                    && height.is_finite()
+                {
+                    options.window_size = Some([width, height]);
+                } else {
+                    let value = value
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "Ignoring invalid --window-size {:?}; expected WIDTHxHEIGHT with width >= 320 and height >= 220",
+                        value
+                    );
+                }
                 continue;
             }
             let value = match arg.to_string_lossy().as_ref() {
@@ -89,12 +142,6 @@ impl CliOptions {
     }
 }
 
-struct GifAsset {
-    frames: Vec<(TextureHandle, Duration)>,
-    started: Instant,
-    total_duration: Duration,
-}
-
 struct YoutubeDialog {
     url: String,
     metadata: Option<VideoMetadata>,
@@ -102,7 +149,7 @@ struct YoutubeDialog {
     metadata_job: Option<youtube::MetadataJob>,
     start_text: String,
     end_text: String,
-    progress: f32,
+    progress: Option<DownloadProgress>,
     job: Option<DownloadJob>,
     error: Option<String>,
     target_element: Option<u64>,
@@ -118,7 +165,7 @@ impl YoutubeDialog {
             metadata_job: None,
             start_text: "0".into(),
             end_text: String::new(),
-            progress: 0.0,
+            progress: None,
             job: None,
             error: None,
             target_element,
@@ -134,22 +181,14 @@ struct AnimRefApp {
     recent: Vec<PathBuf>,
     status: String,
     always_on_top: bool,
-    show_help: bool,
     show_youtube: Option<YoutubeDialog>,
     show_text_dialog: bool,
     text_draft: String,
     image_assets: HashMap<String, TextureHandle>,
-    gif_assets: HashMap<String, GifAsset>,
     image_errors: HashMap<String, String>,
-    video_players: HashMap<String, media::VideoPlayer>,
-    video_textures: HashMap<String, TextureHandle>,
-    video_errors: HashMap<String, String>,
-    pending_video_seek: HashMap<u64, f64>,
     remote_jobs: Vec<crossbeam_channel::Receiver<RemoteImageResult>>,
     remote_pending: HashSet<u64>,
     scene_generation: u64,
-    edit_video_id: Option<u64>,
-    edit_view_backup: Option<(f32, model::Translate)>,
     cli: CliOptions,
     started_at: Instant,
     update_count: u64,
@@ -162,6 +201,23 @@ struct AnimRefApp {
     diagnostic_input_events: VecDeque<String>,
     diagnostic_modifiers: String,
     diagnostic_wants_keyboard: bool,
+    actions: VecDeque<AppAction>,
+    dialogs: DialogCoordinator,
+    toast: Option<(String, Instant)>,
+    context_menu_pos: Option<Pos2>,
+    hovered_header: bool,
+    last_presented_position: HashMap<u64, f64>,
+    animation_paused: HashMap<u64, bool>,
+    texture_paths: HashMap<u64, String>,
+    playback_sessions: HashMap<u64, media::PlaybackSession>,
+    playback_textures: HashMap<u64, TextureHandle>,
+    playback_errors: HashMap<u64, String>,
+    expected_playback_epoch: HashMap<u64, u64>,
+    presented_playback: HashMap<u64, media::PlaybackSnapshot>,
+    pending_seeks: HashMap<u64, f64>,
+    playback_scenario_pending: bool,
+    observed_status: String,
+    window_host: window_host::WindowHost,
 }
 
 impl AnimRefApp {
@@ -175,25 +231,16 @@ impl AnimRefApp {
             selected: None,
             scene_path: None,
             recent,
-            status: "Drop images, GIFs, or videos here. Paste a YouTube URL to choose a clip."
-                .into(),
+            status: String::new(),
             always_on_top: true,
-            show_help: false,
             show_youtube: None,
             show_text_dialog: false,
             text_draft: String::new(),
             image_assets: HashMap::new(),
-            gif_assets: HashMap::new(),
             image_errors: HashMap::new(),
-            video_players: HashMap::new(),
-            video_textures: HashMap::new(),
-            video_errors: HashMap::new(),
-            pending_video_seek: HashMap::new(),
             remote_jobs: Vec::new(),
             remote_pending: HashSet::new(),
             scene_generation: 1,
-            edit_video_id: None,
-            edit_view_backup: None,
             cli,
             started_at: Instant::now(),
             update_count: 0,
@@ -206,6 +253,23 @@ impl AnimRefApp {
             diagnostic_input_events: VecDeque::with_capacity(32),
             diagnostic_modifiers: String::new(),
             diagnostic_wants_keyboard: false,
+            actions: VecDeque::new(),
+            dialogs: DialogCoordinator::default(),
+            toast: None,
+            context_menu_pos: None,
+            hovered_header: false,
+            last_presented_position: HashMap::new(),
+            animation_paused: HashMap::new(),
+            texture_paths: HashMap::new(),
+            playback_sessions: HashMap::new(),
+            playback_textures: HashMap::new(),
+            playback_errors: HashMap::new(),
+            expected_playback_epoch: HashMap::new(),
+            presented_playback: HashMap::new(),
+            pending_seeks: HashMap::new(),
+            playback_scenario_pending: false,
+            observed_status: String::new(),
+            window_host: window_host::WindowHost::default(),
         };
         if let Some(scene_path) = app.cli.scene_path.clone() {
             if let Err(error) = app.load_scene(&scene_path) {
@@ -214,6 +278,28 @@ impl AnimRefApp {
             }
         } else if let Some(last) = app.recent.last().cloned() {
             let _ = app.load_scene(&last);
+        }
+        match app.cli.ui_scenario {
+            UiScenario::Youtube => {
+                let mut dialog = YoutubeDialog::new(
+                    "https://www.youtube.com/watch?v=jNQXAC9IVRw".into(),
+                    None,
+                    app.scene_generation,
+                );
+                dialog.metadata = Some(VideoMetadata {
+                    id: "jNQXAC9IVRw".into(),
+                    title: "Me at the zoo — a deliberately long diagnostic title for responsive layout checks".into(),
+                    duration: Some(19.0),
+                });
+                dialog.start_text = "4".into();
+                dialog.end_text = "6".into();
+                app.show_youtube = Some(dialog);
+            }
+            UiScenario::Menu => app.context_menu_pos = Some(Pos2::new(24.0, 58.0)),
+            UiScenario::Title => app.hovered_header = true,
+            UiScenario::Grid => app.scene.grid.enabled = true,
+            UiScenario::Playback => app.playback_scenario_pending = true,
+            UiScenario::Clean => {}
         }
         app
     }
@@ -293,8 +379,6 @@ impl AnimRefApp {
         self.scene = scene;
         self.scene_path = Some(scene_path.clone());
         self.selected = None;
-        self.edit_video_id = None;
-        self.edit_view_backup = None;
         self.clear_media_caches();
         self.add_recent(scene_path.clone());
         self.status = format!("Loaded {}", scene_path.display());
@@ -302,37 +386,28 @@ impl AnimRefApp {
     }
 
     fn save_scene(&mut self) -> Result<()> {
-        let path = if let Some(path) = self.scene_path.clone() {
-            path
+        if let Some(path) = self.scene_path.clone() {
+            self.save_scene_to(path)
         } else {
-            let Some(path) = rfd::FileDialog::new()
-                .add_filter("AnimRef scene", &["purgif"])
-                .set_file_name("scene.purgif")
-                .save_file()
-            else {
-                return Ok(());
-            };
-            path
-        };
-        self.save_scene_to(path)
+            self.dialogs.enqueue(DialogRequest::SaveScene);
+            Ok(())
+        }
     }
 
     fn save_scene_as(&mut self) -> Result<()> {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("AnimRef scene", &["purgif"])
-            .set_file_name("scene.purgif")
-            .save_file()
-        else {
-            return Ok(());
-        };
-        self.save_scene_to(path)
+        self.dialogs.enqueue(DialogRequest::SaveScene);
+        Ok(())
     }
 
     fn save_scene_to(&mut self, path: PathBuf) -> Result<()> {
         let mut scene_to_save = self.scene.clone();
-        if let Some((scale, translate)) = self.edit_view_backup {
-            scene_to_save.current_scale = scale;
-            scene_to_save.translate = translate;
+        for element in &mut scene_to_save.elements {
+            if let Some(position) = self.last_presented_position.get(&element.id) {
+                element.playback_state.position_seconds = *position;
+            }
+            if let Some(paused) = self.animation_paused.get(&element.id) {
+                element.playback_state.paused = *paused;
+            }
         }
         let text = scene_to_save.to_json()?;
         let parent = path
@@ -368,50 +443,38 @@ impl AnimRefApp {
         self.scene = Scene::default();
         self.scene_path = None;
         self.selected = None;
-        self.edit_video_id = None;
-        self.edit_view_backup = None;
         self.clear_media_caches();
         self.status = "New scene".into();
     }
 
     fn clear_media_caches(&mut self) {
-        self.video_players.clear();
-        self.video_textures.clear();
-        self.video_errors.clear();
+        self.pending_seeks.clear();
+        self.playback_sessions.clear();
+        self.playback_textures.clear();
+        self.playback_errors.clear();
+        self.expected_playback_epoch.clear();
+        self.presented_playback.clear();
+        self.last_presented_position.clear();
+        self.animation_paused.clear();
         self.image_assets.clear();
-        self.gif_assets.clear();
         self.image_errors.clear();
-        self.pending_video_seek.clear();
+        self.texture_paths.clear();
     }
 
     fn clear_item_cache(&mut self, id: u64) {
+        self.pending_seeks.remove(&id);
         let key = id.to_string();
-        self.video_players.remove(&key);
-        self.video_textures.remove(&key);
-        self.video_errors.remove(&key);
         self.image_assets.remove(&key);
-        self.gif_assets.remove(&key);
         self.image_errors.remove(&key);
-        self.pending_video_seek.remove(&id);
+        self.texture_paths.remove(&id);
+        self.playback_sessions.remove(&id);
+        self.playback_textures.remove(&id);
+        self.playback_errors.remove(&id);
+        self.presented_playback.remove(&id);
+        self.last_presented_position.remove(&id);
+        self.animation_paused.remove(&id);
+        self.expected_playback_epoch.remove(&id);
         self.remote_pending.remove(&id);
-    }
-
-    fn enter_video_edit(&mut self, id: u64) {
-        if self.edit_video_id.is_some() {
-            self.exit_video_edit();
-        }
-        self.edit_view_backup = Some((self.scene.current_scale, self.scene.translate));
-        self.scene.current_scale = 1.0;
-        self.scene.translate = model::Translate::default();
-        self.edit_video_id = Some(id);
-    }
-
-    fn exit_video_edit(&mut self) {
-        self.edit_video_id = None;
-        if let Some((scale, translate)) = self.edit_view_backup.take() {
-            self.scene.current_scale = scale;
-            self.scene.translate = translate;
-        }
     }
 
     fn start_youtube_metadata(&mut self, url: String, target_element: Option<u64>) {
@@ -665,95 +728,62 @@ impl AnimRefApp {
             }
             let key = element.id.to_string();
             if self.image_assets.contains_key(&key)
-                || self.gif_assets.contains_key(&key)
                 || self.image_errors.contains_key(&key)
+                || self.texture_paths.contains_key(&element.id)
             {
                 continue;
             }
-            let source = element
-                .cached_path
-                .as_ref()
-                .filter(|p| p.exists())
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| element.path.clone());
-            if is_http_url(&source) {
-                continue;
-            }
-            match read_image_source(&source) {
-                Ok(bytes) => {
-                    if is_gif_source(&source, &bytes) {
-                        match image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
-                            .and_then(|decoder| decoder.into_frames().collect_frames())
-                        {
-                            Ok(frames) => {
-                                let intrinsic_size =
-                                    frames.first().map(|frame| frame.buffer().dimensions());
-                                let mut rendered = Vec::new();
-                                for frame in frames {
-                                    let delay = frame.delay().numer_denom_ms();
-                                    let millis = delay.0.checked_div(delay.1).unwrap_or(80) as u64;
-                                    let buffer = frame.into_buffer();
-                                    let image = ColorImage::from_rgba_unmultiplied(
-                                        [buffer.width() as usize, buffer.height() as usize],
-                                        buffer.as_raw(),
-                                    );
-                                    let texture = ctx.load_texture(
-                                        format!("{key}-{}", rendered.len()),
-                                        image,
-                                        TextureOptions::LINEAR,
-                                    );
-                                    rendered.push((texture, Duration::from_millis(millis.max(20))));
-                                }
-                                if !rendered.is_empty() {
-                                    if let Some((width, height)) = intrinsic_size {
-                                        intrinsic_sizes.push((
-                                            element.id,
-                                            width as f32,
-                                            height as f32,
-                                        ));
-                                    }
-                                    let total = rendered.iter().map(|(_, d)| *d).sum();
-                                    self.gif_assets.insert(
-                                        key,
-                                        GifAsset {
-                                            frames: rendered,
-                                            started: Instant::now(),
-                                            total_duration: total,
-                                        },
-                                    );
-                                }
-                            }
-                            Err(error) => {
-                                self.image_errors.insert(key, error.to_string());
-                            }
-                        }
-                    } else {
-                        match image::load_from_memory(&bytes) {
-                            Ok(dynamic) => {
-                                let rgba = dynamic.to_rgba8();
-                                intrinsic_sizes.push((
-                                    element.id,
-                                    rgba.width() as f32,
-                                    rgba.height() as f32,
-                                ));
-                                let image = ColorImage::from_rgba_unmultiplied(
-                                    [rgba.width() as usize, rgba.height() as usize],
-                                    rgba.as_raw(),
-                                );
-                                self.image_assets.insert(
-                                    key.clone(),
-                                    ctx.load_texture(key, image, TextureOptions::LINEAR),
-                                );
-                            }
-                            Err(error) => {
-                                self.image_errors.insert(key, error.to_string());
-                            }
+            let prepared = match asset_io::prepare(element) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if !(element.is_video() && is_http_url(&element.path)) {
+                        self.image_errors.insert(key, error.to_string());
+                    }
+                    continue;
+                }
+            };
+            match prepared.kind {
+                asset_io::AssetKind::Video => {
+                    if !element.is_video() {
+                        self.image_errors
+                            .insert(key, "A video file must be imported as video media.".into());
+                        continue;
+                    }
+                }
+                asset_io::AssetKind::Gif => {
+                    let path = prepared.path.to_string_lossy().into_owned();
+                    self.texture_paths.insert(element.id, path);
+                    match asset_io::image_rgba(&prepared) {
+                        Ok(rgba) => intrinsic_sizes.push((
+                            element.id,
+                            rgba.width() as f32,
+                            rgba.height() as f32,
+                        )),
+                        Err(error) => {
+                            self.image_errors.insert(key, error.to_string());
                         }
                     }
                 }
-                Err(error) => {
-                    self.image_errors.insert(key, error.to_string());
-                }
+                asset_io::AssetKind::Image => match asset_io::image_rgba(&prepared) {
+                    Ok(rgba) => {
+                        intrinsic_sizes.push((
+                            element.id,
+                            rgba.width() as f32,
+                            rgba.height() as f32,
+                        ));
+                        let image = ColorImage::from_rgba_unmultiplied(
+                            [rgba.width() as usize, rgba.height() as usize],
+                            rgba.as_raw(),
+                        );
+                        self.image_assets.insert(
+                            key.clone(),
+                            ctx.load_texture(key, image, TextureOptions::LINEAR),
+                        );
+                    }
+                    Err(error) => {
+                        self.image_errors.insert(key, error.to_string());
+                    }
+                },
             }
         }
         for (id, source_width, source_height) in intrinsic_sizes {
@@ -766,88 +796,1029 @@ impl AnimRefApp {
                 fill_missing_dimensions(element, source_width, source_height);
             }
         }
-        self.start_video_players();
-        self.drain_video_frames(ctx);
+        self.start_playback_sessions();
+        if self.playback_scenario_pending
+            && let Some(index) = self
+                .scene
+                .elements
+                .iter()
+                .position(|element| self.playback_sessions.contains_key(&element.id))
+        {
+            self.selected = Some(index);
+            self.playback_scenario_pending = false;
+        }
+        self.drain_playback_frames(ctx);
     }
 
-    fn start_video_players(&mut self) {
+    fn start_playback_sessions(&mut self) {
         for element in &self.scene.elements {
-            if !element.is_video() {
+            if self.playback_sessions.contains_key(&element.id)
+                || self.playback_errors.contains_key(&element.id)
+                || self.image_errors.contains_key(&element.id.to_string())
+            {
                 continue;
             }
-            let Some(path) = element.display_path() else {
+            if element.media_type == "youtube" && cached_youtube_path(element).is_none() {
+                continue;
+            }
+            let prepared_path = if let Some(path) = self.texture_paths.get(&element.id) {
+                Some((PathBuf::from(path), media::MediaKind::Gif))
+            } else if element.media_type == "youtube" {
+                // A YouTube webpage URL is never a decoder input. Use its local section cache.
+                if cached_youtube_path(element).is_some() {
+                    match asset_io::prepare(element) {
+                        Ok(prepared) if prepared.kind == asset_io::AssetKind::Video => {
+                            Some((prepared.path, media::MediaKind::Video))
+                        }
+                        Ok(prepared) if prepared.kind == asset_io::AssetKind::Gif => {
+                            self.texture_paths
+                                .insert(element.id, prepared.path.to_string_lossy().into_owned());
+                            Some((prepared.path, media::MediaKind::Gif))
+                        }
+                        Ok(_) => None,
+                        Err(error) => {
+                            self.playback_errors.insert(element.id, error.to_string());
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else if let Some(url) = remote_playback_url(element) {
+                Some((PathBuf::from(url), media::MediaKind::Video))
+            } else if element.is_video() {
+                match asset_io::prepare(element) {
+                    Ok(prepared) if prepared.kind == asset_io::AssetKind::Video => {
+                        Some((prepared.path, media::MediaKind::Video))
+                    }
+                    Ok(prepared) if prepared.kind == asset_io::AssetKind::Gif => {
+                        self.texture_paths
+                            .insert(element.id, prepared.path.to_string_lossy().into_owned());
+                        Some((prepared.path, media::MediaKind::Gif))
+                    }
+                    Ok(_) => None,
+                    Err(error) => {
+                        self.playback_errors.insert(element.id, error.to_string());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let Some((path, kind)) = prepared_path else {
                 continue;
             };
-            let key = element.id.to_string();
-            if self.video_players.contains_key(&key) || self.video_errors.contains_key(&key) {
-                continue;
-            }
-            let is_downloaded_youtube = element.media_type == "youtube";
-            let duration = if is_downloaded_youtube {
+            let duration = if element.media_type == "youtube" {
                 element
                     .media_duration
                     .or_else(|| element.source_range.map(|r| r[1] - r[0]))
             } else {
                 element.media_duration
             };
-            let pairs = if is_downloaded_youtube && !element.playback_loop_pairs.is_empty() {
-                element.playback_loop_pairs.clone()
-            } else {
-                element.loop_pairs.clone()
-            };
-            let active = if is_downloaded_youtube {
+            let pairs =
+                if element.media_type == "youtube" && !element.playback_loop_pairs.is_empty() {
+                    element.playback_loop_pairs.clone()
+                } else {
+                    element.loop_pairs.clone()
+                };
+            let active = if element.media_type == "youtube" {
                 element.active_playback_pair()
             } else {
                 element.active_loop_pair
             };
-            let seek = self.pending_video_seek.remove(&element.id);
-            self.video_players.insert(
-                key,
-                media::VideoPlayer::start_at(path, duration, pairs, active, seek),
+            let session = media::PlaybackSession::start(
+                path,
+                kind,
+                duration,
+                pairs,
+                active,
+                element.playback_state,
             );
+            self.expected_playback_epoch
+                .insert(element.id, session.snapshot().epoch);
+            self.animation_paused
+                .insert(element.id, session.snapshot().paused);
+            self.playback_sessions.insert(element.id, session);
         }
     }
 
-    fn drain_video_frames(&mut self, ctx: &EguiContext) {
-        let mut received_frame = false;
-        for (key, player) in &self.video_players {
-            while let Ok(event) = player.events.try_recv() {
+    fn command_playback(&mut self, id: u64, command: media::PlaybackCommand) {
+        if let Some(session) = self.playback_sessions.get(&id) {
+            let current_epoch = self
+                .expected_playback_epoch
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| session.snapshot().epoch);
+            self.expected_playback_epoch
+                .insert(id, current_epoch.wrapping_add(1));
+            let previous_paused = self
+                .animation_paused
+                .get(&id)
+                .copied()
+                .unwrap_or(session.snapshot().paused);
+            let paused = match command {
+                media::PlaybackCommand::Play => false,
+                media::PlaybackCommand::Pause
+                | media::PlaybackCommand::StepForward
+                | media::PlaybackCommand::StepBackward => true,
+                media::PlaybackCommand::Toggle => !previous_paused,
+                media::PlaybackCommand::Seek(_) | media::PlaybackCommand::Stop => previous_paused,
+            };
+            self.animation_paused.insert(id, paused);
+            session.command(command);
+        }
+    }
+
+    fn drain_playback_frames(&mut self, ctx: &EguiContext) {
+        let ids: Vec<_> = self.playback_sessions.keys().copied().collect();
+        let mut received = false;
+        for id in ids {
+            let Some(session) = self.playback_sessions.get(&id) else {
+                continue;
+            };
+            while let Ok(event) = session.events.try_recv() {
                 match event {
-                    media::PlayerEvent::Frame(bytes) => {
-                        if let Ok(image) = image::load_from_memory(&bytes) {
-                            self.decoded_video_frames = self.decoded_video_frames.saturating_add(1);
-                            if let Ok(element_id) = key.parse::<u64>() {
-                                let count = self
-                                    .decoded_video_frames_by_id
-                                    .entry(element_id)
-                                    .or_default();
-                                *count = count.saturating_add(1);
-                            }
-                            received_frame = true;
-                            let rgba = image.to_rgba8();
-                            let color = ColorImage::from_rgba_unmultiplied(
-                                [rgba.width() as usize, rgba.height() as usize],
-                                rgba.as_raw(),
-                            );
-                            if let Some(texture) = self.video_textures.get_mut(key) {
-                                texture.set(color, TextureOptions::LINEAR);
-                            } else {
-                                self.video_textures.insert(
-                                    key.clone(),
-                                    ctx.load_texture(key.clone(), color, TextureOptions::LINEAR),
+                    media::PlaybackEvent::Frame {
+                        epoch,
+                        position_seconds,
+                        frame_index,
+                        pixels,
+                    } => {
+                        if self
+                            .expected_playback_epoch
+                            .get(&id)
+                            .is_some_and(|expected| *expected != epoch)
+                        {
+                            continue;
+                        }
+                        let decoded = match pixels {
+                            media::DecodedPixels::Jpeg(bytes) => image::load_from_memory(&bytes)
+                                .ok()
+                                .map(|img| img.to_rgba8()),
+                            media::DecodedPixels::Rgba {
+                                width,
+                                height,
+                                bytes,
+                            } => image::RgbaImage::from_raw(width, height, bytes),
+                        };
+                        match decoded {
+                            Some(rgba) => {
+                                let color = ColorImage::from_rgba_unmultiplied(
+                                    [rgba.width() as usize, rgba.height() as usize],
+                                    rgba.as_raw(),
                                 );
+                                if let Some(texture) = self.playback_textures.get_mut(&id) {
+                                    texture.set(color, TextureOptions::LINEAR);
+                                } else {
+                                    self.playback_textures.insert(
+                                        id,
+                                        ctx.load_texture(
+                                            format!("playback-{id}"),
+                                            color,
+                                            TextureOptions::LINEAR,
+                                        ),
+                                    );
+                                }
+                                let mut snapshot = session.snapshot();
+                                snapshot.position_seconds = position_seconds;
+                                snapshot.frame_index = frame_index;
+                                self.presented_playback.insert(id, snapshot);
+                                self.last_presented_position.insert(id, position_seconds);
+                                self.decoded_video_frames =
+                                    self.decoded_video_frames.saturating_add(1);
+                                *self.decoded_video_frames_by_id.entry(id).or_default() += 1;
+                                received = true;
+                            }
+                            None => {
+                                self.playback_errors
+                                    .insert(id, "Could not decode playback frame".into());
                             }
                         }
                     }
-                    media::PlayerEvent::Failed(error) => {
-                        self.video_errors.insert(key.clone(), error);
+                    media::PlaybackEvent::Failed(error) => {
+                        self.playback_errors.insert(id, error);
                     }
                 }
             }
         }
-        if received_frame && self.smoke_report_written {
-            self.write_smoke_report();
+        if received && self.smoke_report_written {
+            self.write_smoke_report(ctx);
         }
+    }
+
+    fn queue_action(&mut self, action: AppAction) {
+        self.actions.push_back(action);
+        self.context_menu_pos = None;
+    }
+
+    fn run_actions(&mut self, ctx: &EguiContext) {
+        while let Some(action) = self.actions.pop_front() {
+            match action {
+                AppAction::NewScene => self.new_scene(),
+                AppAction::OpenScene => self.dialogs.enqueue(DialogRequest::OpenScene),
+                AppAction::OpenRecent(path) => {
+                    let result = self.load_scene(&path);
+                    self.capture_result(result);
+                }
+                AppAction::Save => {
+                    let result = self.save_scene();
+                    self.capture_result(result);
+                }
+                AppAction::SaveAs => {
+                    let result = self.save_scene_as();
+                    self.capture_result(result);
+                }
+                AppAction::ImportMedia => self.dialogs.enqueue(DialogRequest::ImportMedia),
+                AppAction::ExportSelected => self.export_selected(),
+                AppAction::Paste => self.handle_paste(),
+                AppAction::CopySelected => self.copy_selected(),
+                AppAction::DeleteSelected => self.delete_selected(),
+                AppAction::BringForward => self.move_selected_layer(1),
+                AppAction::SendBackward => self.move_selected_layer(-1),
+                AppAction::AddText => self.show_text_dialog = true,
+                AppAction::PrepareYoutube { url, target_id } => {
+                    self.start_youtube_metadata(url, target_id)
+                }
+                AppAction::ToggleGrid => {
+                    self.scene.grid.enabled = !self.scene.grid.enabled;
+                }
+                AppAction::CenterView => self.scene.translate = model::Translate::default(),
+                AppAction::FitView => self.fit_scene(ctx),
+                AppAction::SetLoopStart => self.set_loop_boundary(true),
+                AppAction::SetLoopEnd => self.set_loop_boundary(false),
+                AppAction::ResetLoop => self.reset_active_loop(),
+                AppAction::TogglePin => {
+                    self.always_on_top = !self.always_on_top;
+                    ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if self.always_on_top {
+                        WindowLevel::AlwaysOnTop
+                    } else {
+                        WindowLevel::Normal
+                    }));
+                }
+                AppAction::Minimize => ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
+                AppAction::ToggleMaximize => {
+                    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+                }
+                AppAction::Close => ctx.send_viewport_cmd(ViewportCommand::Close),
+                AppAction::PlayPause => {
+                    if let Some(id) = self.selected_id() {
+                        self.command_playback(id, media::PlaybackCommand::Toggle);
+                    }
+                }
+                AppAction::StepAnimation(direction) => {
+                    if let Some(id) = self.selected_id() {
+                        self.command_playback(
+                            id,
+                            if direction < 0 {
+                                media::PlaybackCommand::StepBackward
+                            } else {
+                                media::PlaybackCommand::StepForward
+                            },
+                        );
+                    }
+                }
+                AppAction::SeekAnimation(position) => {
+                    if let Some(id) = self.selected_id() {
+                        self.command_playback(id, media::PlaybackCommand::Seek(position));
+                    }
+                }
+            }
+        }
+    }
+
+    fn selected_id(&self) -> Option<u64> {
+        self.selected
+            .and_then(|index| self.scene.elements.get(index))
+            .map(|element| element.id)
+    }
+
+    fn delete_selected(&mut self) {
+        if let Some(index) = self
+            .selected
+            .take()
+            .filter(|index| *index < self.scene.elements.len())
+        {
+            let removed = self.scene.elements.remove(index);
+            self.clear_item_cache(removed.id);
+        }
+    }
+
+    fn move_selected_layer(&mut self, direction: isize) {
+        let Some(index) = self
+            .selected
+            .filter(|index| *index < self.scene.elements.len())
+        else {
+            return;
+        };
+        let next =
+            (index as isize + direction).clamp(0, self.scene.elements.len() as isize - 1) as usize;
+        if next != index {
+            let element = self.scene.elements.remove(index);
+            self.scene.elements.insert(next, element);
+            self.selected = Some(next);
+        }
+    }
+
+    fn set_loop_boundary(&mut self, start: bool) {
+        let Some(index) = self
+            .selected
+            .filter(|index| *index < self.scene.elements.len())
+        else {
+            return;
+        };
+        let id = self.scene.elements[index].id;
+        self.persist_playback_state(id);
+        let state = self.presented_playback.get(&id).copied().or_else(|| {
+            self.playback_sessions
+                .get(&id)
+                .map(media::PlaybackSession::snapshot)
+        });
+        let Some(state) = state else {
+            return;
+        };
+        let Some(duration) = state.duration_seconds.filter(|duration| *duration > 0.0) else {
+            return;
+        };
+        let position = (state.position_seconds / duration * 100.0).clamp(0.0, 100.0);
+        let element = &mut self.scene.elements[index];
+        let active_index = element.active_playback_pair();
+        let pairs = if element.media_type == "youtube" && !element.playback_loop_pairs.is_empty() {
+            &mut element.playback_loop_pairs
+        } else {
+            &mut element.loop_pairs
+        };
+        if pairs.is_empty() {
+            pairs.push([0.0, 100.0]);
+        }
+        let active = active_index.min(pairs.len() - 1);
+        if start {
+            pairs[active][0] = position.min((pairs[active][1] - 0.1).max(0.0));
+        } else {
+            pairs[active][1] = position.max((pairs[active][0] + 0.1).min(100.0));
+        }
+        self.playback_sessions.remove(&id);
+        self.playback_textures.remove(&id);
+        self.presented_playback.remove(&id);
+        self.last_presented_position.remove(&id);
+    }
+
+    fn reset_active_loop(&mut self) {
+        let Some(index) = self
+            .selected
+            .filter(|index| *index < self.scene.elements.len())
+        else {
+            return;
+        };
+        let id = self.scene.elements[index].id;
+        self.persist_playback_state(id);
+        let element = &mut self.scene.elements[index];
+        let active_index = element.active_playback_pair();
+        let pairs = if element.media_type == "youtube" && !element.playback_loop_pairs.is_empty() {
+            &mut element.playback_loop_pairs
+        } else {
+            &mut element.loop_pairs
+        };
+        if pairs.is_empty() {
+            pairs.push([0.0, 100.0]);
+        }
+        let active = active_index.min(pairs.len() - 1);
+        pairs[active] = [0.0, 100.0];
+        self.playback_sessions.remove(&id);
+        self.playback_textures.remove(&id);
+        self.presented_playback.remove(&id);
+        self.last_presented_position.remove(&id);
+    }
+
+    fn persist_playback_state(&mut self, id: u64) {
+        let position = self.last_presented_position.get(&id).copied();
+        let paused = self.animation_paused.get(&id).copied();
+        if let Some(element) = self
+            .scene
+            .elements
+            .iter_mut()
+            .find(|element| element.id == id)
+        {
+            if let Some(position) = position {
+                element.playback_state.position_seconds = position;
+            }
+            if let Some(paused) = paused {
+                element.playback_state.paused = paused;
+            }
+        }
+    }
+
+    fn fit_scene(&mut self, ctx: &EguiContext) {
+        if self.scene.elements.is_empty() {
+            self.scene.current_scale = 1.0;
+            self.scene.translate = model::Translate::default();
+            return;
+        }
+        let min_x = self
+            .scene
+            .elements
+            .iter()
+            .map(|element| element.x)
+            .fold(f32::INFINITY, f32::min);
+        let min_y = self
+            .scene
+            .elements
+            .iter()
+            .map(|element| element.y)
+            .fold(f32::INFINITY, f32::min);
+        let max_x = self
+            .scene
+            .elements
+            .iter()
+            .map(|element| element.x + element.width.unwrap_or(320.0))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let max_y = self
+            .scene
+            .elements
+            .iter()
+            .map(|element| element.y + element.height.unwrap_or(200.0))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bounds = Vec2::new((max_x - min_x).max(1.0), (max_y - min_y).max(1.0));
+        let view = ctx.screen_rect().size() - Vec2::splat(64.0);
+        self.scene.current_scale = (view.x / bounds.x).min(view.y / bounds.y).clamp(0.01, 2.0);
+        self.scene.translate.x = (view.x - bounds.x * self.scene.current_scale) * 0.5
+            - min_x * self.scene.current_scale
+            + 32.0;
+        self.scene.translate.y = (view.y - bounds.y * self.scene.current_scale) * 0.5
+            - min_y * self.scene.current_scale
+            + 32.0;
+    }
+
+    fn copy_selected(&mut self) {
+        let Some(index) = self
+            .selected
+            .filter(|index| *index < self.scene.elements.len())
+        else {
+            return;
+        };
+        let element = self.scene.elements[index].clone();
+        if element.media_type == "text" {
+            self.set_clipboard_text(&element.path);
+            return;
+        }
+        match asset_io::prepare(&element).and_then(|prepared| match prepared.kind {
+            asset_io::AssetKind::Video | asset_io::AssetKind::Gif => {
+                self.set_clipboard_file(&prepared.path);
+                Ok(())
+            }
+            asset_io::AssetKind::Image => {
+                let rgba = asset_io::image_rgba(&prepared)?;
+                let payload = arboard::ImageData {
+                    width: rgba.width() as usize,
+                    height: rgba.height() as usize,
+                    bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+                };
+                arboard::Clipboard::new()?
+                    .set_image(payload)
+                    .map_err(anyhow::Error::from)?;
+                self.status = "Image copied".into();
+                Ok(())
+            }
+        }) {
+            Ok(()) => {}
+            Err(error) => self.status = format!("Could not copy selected media: {error:#}"),
+        }
+    }
+
+    fn set_clipboard_text(&mut self, text: &str) {
+        match arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text.to_owned()))
+        {
+            Ok(()) => self.status = "Text copied".into(),
+            Err(error) => self.status = format!("Could not copy text: {error}"),
+        }
+    }
+
+    fn set_clipboard_file(&mut self, path: &Path) {
+        #[cfg(windows)]
+        {
+            use clipboard_win::Setter;
+            let path = path.to_string_lossy().into_owned();
+            match clipboard_win::formats::FileList.write_clipboard(&[path]) {
+                Ok(()) => self.status = "File copied".into(),
+                Err(error) => self.status = format!("Could not copy file: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        self.set_clipboard_text(&path.to_string_lossy());
+    }
+
+    fn export_selected(&mut self) {
+        let Some(index) = self
+            .selected
+            .filter(|index| *index < self.scene.elements.len())
+        else {
+            return;
+        };
+        let element = self.scene.elements[index].clone();
+        if element.media_type == "text" {
+            self.dialogs.enqueue(DialogRequest::SaveText {
+                contents: element.path,
+                suggested_name: "text.txt".into(),
+            });
+            return;
+        }
+        match asset_io::prepare(&element) {
+            Ok(prepared) => self.dialogs.enqueue(DialogRequest::ExportFile {
+                source: prepared.path,
+                suggested_name: prepared.suggested_name,
+            }),
+            Err(error) => self.status = format!("Could not prepare media for export: {error:#}"),
+        }
+    }
+
+    fn handle_dialog_result(&mut self, result: DialogResult) {
+        match result {
+            DialogResult::OpenScene(Some(path)) => {
+                let result = self.load_scene(&path);
+                self.capture_result(result);
+            }
+            DialogResult::OpenScene(None)
+            | DialogResult::SaveScene(None)
+            | DialogResult::ImportMedia(None) => {}
+            DialogResult::SaveScene(Some(path)) => {
+                let result = self.save_scene_to(path);
+                self.capture_result(result);
+            }
+            DialogResult::ImportMedia(Some(paths)) => {
+                for path in paths {
+                    self.import_path(&path);
+                }
+            }
+            DialogResult::ExportFile {
+                source,
+                destination: Some(destination),
+            } => {
+                let same_file = matches!(
+                    (fs::canonicalize(&source), fs::canonicalize(&destination)),
+                    (Ok(source), Ok(destination)) if source == destination
+                );
+                if same_file {
+                    self.status = "Selected destination already contains this file".into();
+                } else if let Err(error) = copy_file_atomically(&source, &destination) {
+                    self.status = format!("Could not export {}: {error}", source.display());
+                } else {
+                    self.status = format!("Exported {}", destination.display());
+                }
+            }
+            DialogResult::ExportFile {
+                destination: None, ..
+            } => {}
+            DialogResult::SaveText {
+                contents,
+                destination: Some(destination),
+            } => {
+                if let Err(error) = write_file_atomically(&destination, contents.as_bytes()) {
+                    self.status = format!("Could not export text: {error}");
+                } else {
+                    self.status = format!("Exported {}", destination.display());
+                }
+            }
+            DialogResult::SaveText {
+                destination: None, ..
+            } => {}
+        }
+    }
+
+    fn draw_hover_header(&mut self, ctx: &EguiContext) {
+        let pointer = ctx.input(|input| input.pointer.hover_pos());
+        let show =
+            self.cli.ui_scenario == UiScenario::Title || pointer.is_some_and(|pos| pos.y <= 42.0);
+        self.hovered_header = show;
+        if !show {
+            return;
+        }
+        let title = self
+            .scene_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
+        let width = ctx.screen_rect().width();
+        egui::Area::new(egui::Id::new("floating-header"))
+            .fixed_pos(Pos2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(32, 35, 41, 245))
+                    .inner_margin(egui::Margin::symmetric(10, 5))
+                    .show(ui, |ui| {
+                        ui.set_width((width - 20.0).max(280.0));
+                        ui.horizontal(|ui| {
+                            let title_width = (ui.available_width() - 148.0).max(72.0);
+                            let (title_rect, drag) =
+                                ui.allocate_exact_size(Vec2::new(title_width, 25.0), Sense::drag());
+                            let drag = drag.on_hover_text(
+                                self.scene_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_else(|| "Unsaved scene".into()),
+                            );
+                            let title_color = ui.visuals().text_color();
+                            let title_font = egui::FontId::proportional(16.0);
+                            let title_galley = ellipsized_galley(
+                                ui.painter(),
+                                &title,
+                                title_font,
+                                title_color,
+                                title_rect.width(),
+                            );
+                            ui.painter().with_clip_rect(title_rect).galley(
+                                Pos2::new(
+                                    title_rect.left(),
+                                    title_rect.center().y - title_galley.size().y * 0.5,
+                                ),
+                                title_galley,
+                                title_color,
+                            );
+                            if drag.dragged() {
+                                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                            }
+                            let pin = ui
+                                .add_sized([28.0, 25.0], egui::Button::new(""))
+                                .on_hover_text(if self.always_on_top {
+                                    "Always on top (enabled)"
+                                } else {
+                                    "Always on top (disabled)"
+                                });
+                            let pin_color = if self.always_on_top {
+                                Color32::from_rgb(90, 190, 235)
+                            } else {
+                                Color32::from_gray(190)
+                            };
+                            let pin_head =
+                                Pos2::new(pin.rect.center().x, pin.rect.center().y - 5.0);
+                            ui.painter().circle_filled(pin_head, 3.0, pin_color);
+                            ui.painter().line_segment(
+                                [
+                                    pin_head + Vec2::new(0.0, 2.0),
+                                    pin_head + Vec2::new(-4.0, 9.0),
+                                ],
+                                Stroke::new(2.0_f32, pin_color),
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    pin_head + Vec2::new(-6.0, 9.0),
+                                    pin_head + Vec2::new(2.0, 9.0),
+                                ],
+                                Stroke::new(1.5_f32, pin_color),
+                            );
+                            if pin.clicked() {
+                                self.queue_action(AppAction::TogglePin);
+                            }
+                            if ui
+                                .add_sized([28.0, 25.0], egui::Button::new("—"))
+                                .on_hover_text("Minimize")
+                                .clicked()
+                            {
+                                self.queue_action(AppAction::Minimize);
+                            }
+                            let maximized =
+                                ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                            if ui
+                                .add_sized(
+                                    [28.0, 25.0],
+                                    egui::Button::new(if maximized { "❐" } else { "□" }),
+                                )
+                                .on_hover_text("Maximize / restore")
+                                .clicked()
+                            {
+                                self.queue_action(AppAction::ToggleMaximize);
+                            }
+                            if ui
+                                .add_sized([28.0, 25.0], egui::Button::new("×"))
+                                .on_hover_text("Close")
+                                .clicked()
+                            {
+                                self.queue_action(AppAction::Close);
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn draw_context_menu(&mut self, ctx: &EguiContext) {
+        let Some(raw_position) = self.context_menu_pos else {
+            return;
+        };
+        let screen = ctx.screen_rect();
+        let position = Pos2::new(
+            raw_position.x.clamp(
+                screen.left() + 8.0,
+                (screen.right() - 248.0).max(screen.left() + 8.0),
+            ),
+            raw_position.y.clamp(
+                screen.top() + 8.0,
+                (screen.bottom() - 340.0).max(screen.top() + 8.0),
+            ),
+        );
+        let mut action = None;
+        let area = egui::Area::new(egui::Id::new("canvas-context-menu"))
+            .fixed_pos(position)
+            .constrain(true)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height((screen.height() - 24.0).max(160.0))
+                    .show(ui, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(232.0);
+                            ui.spacing_mut().interact_size.y = 22.0;
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            for (label, candidate) in [
+                                ("Open…", AppAction::OpenScene),
+                                ("Save", AppAction::Save),
+                                ("Save As…", AppAction::SaveAs),
+                                ("New", AppAction::NewScene),
+                                ("Import media…", AppAction::ImportMedia),
+                                ("Add text…", AppAction::AddText),
+                                ("Paste", AppAction::Paste),
+                            ] {
+                                if context_menu_row(ui, label, true).clicked() {
+                                    action = Some(candidate);
+                                }
+                            }
+                            let media_not_local = self
+                                .selected
+                                .and_then(|index| self.scene.elements.get(index))
+                                .is_some_and(|element| {
+                                    (element.media_type == "youtube" || is_http_url(&element.path))
+                                        && element
+                                            .cached_path
+                                            .as_ref()
+                                            .is_none_or(|path| !path.exists())
+                                });
+                            if context_menu_row(ui, "Copy selected", !media_not_local)
+                                .on_hover_text(if media_not_local {
+                                    "This media has no local file to copy or export yet"
+                                } else {
+                                    "Copy selected content to the system clipboard"
+                                })
+                                .clicked()
+                            {
+                                action = Some(AppAction::CopySelected);
+                            }
+                            if context_menu_row(ui, "Export selected…", !media_not_local)
+                                .on_hover_text(if media_not_local {
+                                    "This media has no local file to copy or export yet"
+                                } else {
+                                    "Export the original media file"
+                                })
+                                .clicked()
+                            {
+                                action = Some(AppAction::ExportSelected);
+                            }
+                            ui.separator();
+                            for (label, candidate) in [
+                                ("Bring forward", AppAction::BringForward),
+                                ("Send back", AppAction::SendBackward),
+                                ("Delete", AppAction::DeleteSelected),
+                                (
+                                    if self.scene.grid.enabled {
+                                        "✓  Grid & snap"
+                                    } else {
+                                        "Grid & snap"
+                                    },
+                                    AppAction::ToggleGrid,
+                                ),
+                                ("Center view", AppAction::CenterView),
+                                ("Fit all", AppAction::FitView),
+                            ] {
+                                if context_menu_row(ui, label, true).clicked() {
+                                    action = Some(candidate);
+                                }
+                            }
+                            ui.menu_button("Recent", |ui| {
+                                for path in self.recent.clone().into_iter().rev() {
+                                    let label = path
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    if context_menu_row(ui, &label, true)
+                                        .on_hover_text(path.display().to_string())
+                                        .clicked()
+                                    {
+                                        action = Some(AppAction::OpenRecent(path));
+                                    }
+                                }
+                            });
+                            ui.menu_button("Window", |ui| {
+                                for (label, candidate) in [
+                                    ("Always on top", AppAction::TogglePin),
+                                    ("Maximize / restore", AppAction::ToggleMaximize),
+                                    ("Minimize", AppAction::Minimize),
+                                    ("Close", AppAction::Close),
+                                ] {
+                                    if context_menu_row(ui, label, true).clicked() {
+                                        action = Some(candidate);
+                                    }
+                                }
+                            });
+                            if let Some(index) = self
+                                .selected
+                                .filter(|index| *index < self.scene.elements.len())
+                            {
+                                let element = &self.scene.elements[index];
+                                let has_duration = element.media_duration.is_some()
+                                    || self
+                                        .presented_playback
+                                        .get(&element.id)
+                                        .and_then(|snapshot| snapshot.duration_seconds)
+                                        .is_some();
+                                if element.is_video() && has_duration {
+                                    ui.menu_button("Playback", |ui| {
+                                        if context_menu_row(ui, "Set loop start here", true)
+                                            .clicked()
+                                        {
+                                            action = Some(AppAction::SetLoopStart);
+                                        }
+                                        if context_menu_row(ui, "Set loop end here", true).clicked()
+                                        {
+                                            action = Some(AppAction::SetLoopEnd);
+                                        }
+                                        if context_menu_row(ui, "Reset active loop", true).clicked()
+                                        {
+                                            action = Some(AppAction::ResetLoop);
+                                        }
+                                    });
+                                }
+                                if element.media_type == "youtube"
+                                    && context_menu_row(
+                                        ui,
+                                        if element
+                                            .cached_path
+                                            .as_ref()
+                                            .is_some_and(|path| path.exists())
+                                        {
+                                            "Download another section…"
+                                        } else {
+                                            "Choose section…"
+                                        },
+                                        true,
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(AppAction::PrepareYoutube {
+                                        url: element.path.clone(),
+                                        target_id: Some(element.id),
+                                    });
+                                }
+                            }
+                        });
+                    });
+            });
+        if let Some(action) = action {
+            self.queue_action(action);
+        }
+        let menu_rect = area.response.rect;
+        let clicked_elsewhere = ctx.input(|input| input.pointer.any_click())
+            && ctx.input(|input| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|point| !menu_rect.contains(point))
+            });
+        if clicked_elsewhere {
+            self.context_menu_pos = None;
+        }
+    }
+
+    fn draw_selection_bar(&mut self, ctx: &EguiContext) {
+        let Some(index) = self
+            .selected
+            .filter(|index| *index < self.scene.elements.len())
+        else {
+            self.pending_seeks.clear();
+            return;
+        };
+        let element = &self.scene.elements[index];
+        let id = element.id;
+        self.pending_seeks.retain(|pending_id, _| *pending_id == id);
+        let animated = element.is_video() || self.playback_sessions.contains_key(&id);
+        if !animated {
+            return;
+        }
+        let mut state =
+            self.presented_playback
+                .get(&id)
+                .copied()
+                .unwrap_or(media::PlaybackSnapshot {
+                    paused: element.playback_state.paused,
+                    position_seconds: element.playback_state.position_seconds,
+                    duration_seconds: element.media_duration,
+                    frame_index: None,
+                    epoch: 0,
+                });
+        state.paused = self
+            .animation_paused
+            .get(&id)
+            .copied()
+            .unwrap_or(state.paused);
+        let mut seek = self
+            .pending_seeks
+            .get(&id)
+            .copied()
+            .unwrap_or(state.position_seconds);
+        egui::Area::new(egui::Id::new("animation-transport"))
+            .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -16.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(30, 34, 43, 238))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("|◀").clicked() {
+                                self.queue_action(AppAction::StepAnimation(-1));
+                            }
+                            if ui
+                                .small_button(if state.paused { "▶" } else { "Ⅱ" })
+                                .clicked()
+                            {
+                                self.queue_action(AppAction::PlayPause);
+                            }
+                            if ui.small_button("▶|").clicked() {
+                                self.queue_action(AppAction::StepAnimation(1));
+                            }
+                            if let Some(duration) =
+                                state.duration_seconds.filter(|duration| *duration > 0.0)
+                            {
+                                let response = ui.add(
+                                    egui::Slider::new(&mut seek, 0.0..=duration)
+                                        .show_value(false)
+                                        .trailing_fill(true)
+                                        .fixed_decimals(2)
+                                        .min_decimals(2)
+                                        .max_decimals(2),
+                                );
+                                ui.label(format!("{:.2}/{:.2}s", state.position_seconds, duration));
+                                let response_has_focus = response.has_focus();
+                                let (pointer_down, keyboard_seek) = ctx.input(|input| {
+                                    (
+                                        input.pointer.button_down(egui::PointerButton::Primary)
+                                            && response.hovered(),
+                                        response_has_focus
+                                            && [
+                                                Key::ArrowLeft,
+                                                Key::ArrowRight,
+                                                Key::ArrowUp,
+                                                Key::ArrowDown,
+                                                Key::Home,
+                                                Key::End,
+                                                Key::PageUp,
+                                                Key::PageDown,
+                                            ]
+                                            .into_iter()
+                                            .any(|key| input.key_pressed(key)),
+                                    )
+                                });
+                                if response.changed() && pointer_down {
+                                    self.pending_seeks.insert(id, seek);
+                                }
+                                if response.drag_stopped()
+                                    || response.clicked()
+                                    || (response.changed() && keyboard_seek)
+                                {
+                                    self.pending_seeks.remove(&id);
+                                    self.queue_action(AppAction::SeekAnimation(seek));
+                                }
+                            } else {
+                                ui.label(format!("{:.2}s", state.position_seconds));
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn draw_toast(&mut self, ctx: &EguiContext) {
+        if self.status != self.observed_status {
+            self.observed_status = self.status.clone();
+            if !self.status.is_empty() {
+                self.toast = Some((self.status.clone(), Instant::now()));
+            }
+        }
+        let Some((message, created)) = self.toast.as_ref() else {
+            return;
+        };
+        if created.elapsed() > Duration::from_secs(4) {
+            self.toast = None;
+            return;
+        }
+        egui::Area::new(egui::Id::new("toast"))
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 12.0))
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(message);
+                });
+            });
     }
 
     fn update_diagnostics(&mut self, ctx: &EguiContext) {
@@ -926,20 +1897,20 @@ impl AnimRefApp {
         }
         if got_screenshot
             && self.cli.smoke_report_path.is_some()
-            && self.started_at.elapsed() >= Duration::from_secs(2)
+            && self.started_at.elapsed() >= Duration::from_millis(4500)
         {
-            self.write_smoke_report();
+            self.write_smoke_report(ctx);
         }
 
         let video_textures_ready = self
             .scene
             .elements
             .iter()
-            .filter(|element| element.is_video())
-            .all(|element| self.video_textures.contains_key(&element.id.to_string()));
+            .filter(|element| element.is_video() || self.texture_paths.contains_key(&element.id))
+            .all(|element| self.playback_textures.contains_key(&element.id));
         if !self.screenshot_requested
             && self.cli.screenshot_path.is_some()
-            && self.started_at.elapsed() >= Duration::from_secs(2)
+            && self.started_at.elapsed() >= Duration::from_millis(4500)
             && (video_textures_ready || self.started_at.elapsed() >= Duration::from_secs(10))
         {
             self.screenshot_requested = true;
@@ -948,17 +1919,17 @@ impl AnimRefApp {
         }
 
         if self.smoke_report_written && had_input_events {
-            self.write_smoke_report();
+            self.write_smoke_report(ctx);
         }
 
         if !self.smoke_report_written
             && self.cli.smoke_report_path.is_some()
-            && self.started_at.elapsed() >= Duration::from_secs(2)
+            && self.started_at.elapsed() >= Duration::from_millis(4500)
             && (self.cli.screenshot_path.is_none()
                 || self.screenshot_result.is_some()
                 || self.started_at.elapsed() >= Duration::from_secs(12))
         {
-            self.write_smoke_report();
+            self.write_smoke_report(ctx);
         }
 
         let screenshot_succeeded = self.cli.screenshot_path.is_none()
@@ -966,18 +1937,12 @@ impl AnimRefApp {
                 .screenshot_result
                 .as_ref()
                 .is_some_and(|result| result.starts_with("saved "));
-        if self.cli.quit_after_smoke
-            && self.smoke_report_written
-            && screenshot_succeeded
-            && self
-                .smoke_report_update
-                .is_some_and(|written_at| self.update_count >= written_at.saturating_add(3))
-        {
+        if self.smoke_exit_ready(screenshot_succeeded) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
 
-    fn write_smoke_report(&mut self) {
+    fn write_smoke_report(&mut self, ctx: &EguiContext) {
         let Some(report_path) = self.cli.smoke_report_path.as_ref() else {
             return;
         };
@@ -998,15 +1963,21 @@ impl AnimRefApp {
                     "sourceRange": element.source_range,
                     "mediaDuration": element.media_duration,
                     "decodedFrames": self.decoded_video_frames_by_id.get(&element.id).copied().unwrap_or(0),
-                    "playheadSeconds": self.video_players.get(&key).map(media::VideoPlayer::playhead),
+                    "playbackState": element.playback_state,
+                    "presentedPositionSeconds": self.last_presented_position.get(&element.id).copied(),
+                    "paused": self.animation_paused.get(&element.id).copied().unwrap_or(element.playback_state.paused),
                     "imageError": self.image_errors.get(&key),
-                    "videoError": self.video_errors.get(&key),
+                    "videoError": self.playback_errors.get(&element.id),
                 })
             })
             .collect::<Vec<_>>();
         let report = serde_json::json!({
             "processId": std::process::id(),
             "scenePath": self.scene_path,
+            "uiScenario": match self.cli.ui_scenario { UiScenario::Clean => "clean", UiScenario::Title => "title", UiScenario::Menu => "menu", UiScenario::Playback => "playback", UiScenario::Youtube => "youtube", UiScenario::Grid => "grid" },
+            "windowSize": self.cli.window_size,
+            "actualViewportSize": [ctx.screen_rect().width(), ctx.screen_rect().height()],
+            "pixelsPerPoint": ctx.pixels_per_point(),
             "elapsedSeconds": self.started_at.elapsed().as_secs_f64(),
             "updateCount": self.update_count,
             "firstUpdateObserved": self.update_count > 0,
@@ -1034,425 +2005,118 @@ impl AnimRefApp {
         if let Err(error) = result {
             eprintln!("AnimRef smoke report failed: {error:#}");
         } else {
-            self.smoke_report_written = true;
-            self.smoke_report_update = Some(self.update_count);
+            self.mark_smoke_report_written();
         }
     }
 
-    fn draw_top_bar(&mut self, ctx: &EguiContext) {
-        egui::TopBottomPanel::top("titlebar")
-            .exact_height(34.0)
-            .frame(egui::Frame::new().fill(Color32::from_rgb(36, 36, 40)))
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    let drag =
-                        ui.add_sized([18.0, 28.0], egui::Label::new("⋮").sense(Sense::drag()));
-                    if drag.dragged() {
-                        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
-                    }
-                    ui.label(
-                        egui::RichText::new("AnimRef")
-                            .strong()
-                            .color(Color32::LIGHT_GRAY),
-                    );
-                    ui.separator();
-                    if ui.button("Open").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("AnimRef scene", &["purgif"])
-                            .pick_file()
-                    {
-                        let result = self.load_scene(&path);
-                        self.capture_result(result);
-                    }
-                    if ui.button("Save").clicked() {
-                        let result = self.save_scene();
-                        self.capture_result(result);
-                    }
-                    if ui.button("Save As").clicked() {
-                        let result = self.save_scene_as();
-                        self.capture_result(result);
-                    }
-                    if ui.button("New").clicked() {
-                        self.new_scene();
-                    }
-                    if ui.button("Add media").clicked()
-                        && let Some(paths) = rfd::FileDialog::new()
-                            .add_filter(
-                                "Images and video",
-                                &[
-                                    "png", "jpg", "jpeg", "gif", "webp", "bmp", "mp4", "mov",
-                                    "mkv", "webm", "avi",
-                                ],
-                            )
-                            .pick_files()
-                    {
-                        for path in paths {
-                            self.import_path(&path);
-                        }
-                    }
-                    if ui.button("Text").clicked() {
-                        self.show_text_dialog = true;
-                    }
-                    if ui.button("Paste").clicked() {
-                        self.handle_paste();
-                    }
-                    ui.menu_button("Recent", |ui| {
-                        for path in self.recent.clone().into_iter().rev() {
-                            if ui.button(path.to_string_lossy()).clicked() {
-                                let result = self.load_scene(&path);
-                                self.capture_result(result);
-                                ui.close();
-                            }
-                        }
-                    });
-                    if ui.button("Help").clicked() {
-                        self.show_help = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").clicked() {
-                            ctx.send_viewport_cmd(ViewportCommand::Close);
-                        }
-                        if ui.small_button("□").clicked() {
-                            let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                            ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
-                        }
-                        if ui.small_button("—").clicked() {
-                            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-                        }
-                        let mut always_on_top = self.always_on_top;
-                        if ui.checkbox(&mut always_on_top, "Top").changed() {
-                            self.always_on_top = always_on_top;
-                            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if always_on_top {
-                                WindowLevel::AlwaysOnTop
-                            } else {
-                                WindowLevel::Normal
-                            }));
-                        }
-                    });
-                });
-            });
+    fn mark_smoke_report_written(&mut self) {
+        self.smoke_report_written = true;
+        self.smoke_report_update.get_or_insert(self.update_count);
     }
 
-    fn draw_inspector(&mut self, ctx: &EguiContext) {
-        let mut youtube_action: Option<(String, u64)> = None;
-        let mut edit_action: Option<u64> = None;
-        let mut restart_video: Option<u64> = None;
-        let mut delete_selected = false;
-        let selected = self.selected.filter(|i| *i < self.scene.elements.len());
-        egui::SidePanel::right("inspector")
-            .resizable(true)
-            .default_width(210.0)
-            .min_width(170.0)
-            .show(ctx, |ui| {
-                ui.heading("Scene");
-                ui.label(format!("{} items", self.scene.elements.len()));
-                ui.horizontal(|ui| {
-                    if ui.button("−").clicked() {
-                        self.scene.current_scale = (self.scene.current_scale / 1.15).max(0.01);
-                    }
-                    ui.label(format!("{:.0}%", self.scene.current_scale * 100.0));
-                    if ui.button("+").clicked() {
-                        self.scene.current_scale = (self.scene.current_scale * 1.15).min(2.0);
-                    }
-                    if ui.button("Center").clicked() {
-                        self.scene.translate = model::Translate::default();
-                    }
-                });
-                ui.separator();
-                let Some(index) = selected else {
-                    ui.label("Select an item to edit it.");
-                    ui.label("Hold Space and drag to pan. Use the wheel to zoom.");
-                    return;
-                };
-                ui.heading("Selected item");
-                let element = &mut self.scene.elements[index];
-                ui.label(element.media_type.to_uppercase());
-                ui.label(egui::RichText::new(&element.path).small().weak());
-                ui.horizontal(|ui| {
-                    ui.label("X");
-                    ui.add(egui::DragValue::new(&mut element.x).speed(1.0));
-                    ui.label("Y");
-                    ui.add(egui::DragValue::new(&mut element.y).speed(1.0));
-                });
-                let mut width = element.width.unwrap_or(320.0);
-                let mut height = element.height.unwrap_or(200.0);
-                ui.horizontal(|ui| {
-                    ui.label("W");
-                    ui.add(egui::DragValue::new(&mut width).range(10.0..=10000.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("H");
-                    ui.add(egui::DragValue::new(&mut height).range(10.0..=10000.0));
-                });
-                element.width = Some(width);
-                element.height = Some(height);
-                if element.is_video() {
-                    let duration = if element.media_type == "youtube" {
-                        element.source_range.map(|r| r[1] - r[0])
-                    } else {
-                        element.media_duration
-                    };
-                    if let Some(duration) = duration {
-                        ui.label(format!("Duration {:.2}s", duration));
-                    }
-                    let mut pairs = if element.media_type == "youtube"
-                        && !element.playback_loop_pairs.is_empty()
-                    {
-                        element.playback_loop_pairs.clone()
-                    } else {
-                        element.loop_pairs.clone()
-                    };
-                    let active_pair = element.active_playback_pair();
-                    let active_pair = active_pair.min(pairs.len().saturating_sub(1));
-                    if let Some(pair) = pairs.get_mut(active_pair) {
-                        ui.label("Loop range (%)");
-                        let before = *pair;
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut pair[0])
-                                    .range(0.0..=99.0)
-                                    .speed(0.5),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut pair[1])
-                                    .range(1.0..=100.0)
-                                    .speed(0.5),
-                            );
-                        });
-                        if pair[0] >= pair[1] {
-                            pair[0] = (pair[1] - 1.0).max(0.0);
-                        }
-                        if *pair != before {
-                            restart_video = Some(element.id);
-                        }
-                        if element.media_type == "youtube" {
-                            element.playback_loop_pairs = pairs;
-                        } else {
-                            element.loop_pairs = pairs;
-                        }
-                    }
-                    if element.media_type == "youtube" {
-                        if element.cached_path.as_ref().is_some_and(|p| p.exists()) {
-                            if ui.button("Download another section…").clicked() {
-                                youtube_action = Some((element.path.clone(), element.id));
-                            }
-                        } else if ui.button("Choose section and download…").clicked() {
-                            youtube_action = Some((element.path.clone(), element.id));
-                        }
-                    }
-                    if ui
-                        .button(if self.edit_video_id == Some(element.id) {
-                            "Exit video edit"
-                        } else {
-                            "Edit video"
-                        })
-                        .clicked()
-                    {
-                        edit_action = Some(element.id);
-                    }
-                }
-                delete_selected = ui.button("Delete item").clicked();
-            });
-        if let Some((url, id)) = youtube_action {
-            self.start_youtube_metadata(url, Some(id));
-        }
-        if let Some(id) = restart_video {
-            self.video_players.remove(&id.to_string());
-            self.video_textures.remove(&id.to_string());
-        }
-        if let Some(id) = edit_action {
-            if self.edit_video_id == Some(id) {
-                self.exit_video_edit();
-            } else {
-                self.enter_video_edit(id);
-            }
-        }
-        if delete_selected && let Some(index) = selected {
-            let removed = self.scene.elements.remove(index);
-            self.clear_item_cache(removed.id);
-            self.selected = None;
-        }
+    fn smoke_exit_ready(&self, screenshot_succeeded: bool) -> bool {
+        self.cli.quit_after_smoke
+            && self.smoke_report_written
+            && screenshot_succeeded
+            && self
+                .smoke_report_update
+                .is_some_and(|written_at| self.update_count >= written_at.saturating_add(3))
     }
 
-    fn draw_canvas(&mut self, ctx: &EguiContext) {
+    fn draw_canvas_surface(&mut self, ctx: &EguiContext) {
         self.ensure_assets(ctx);
-        let modal_active = self.show_youtube.is_some() || self.show_text_dialog || self.show_help;
+        let modal_active = self.show_youtube.is_some() || self.show_text_dialog;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::from_rgb(30, 30, 32)))
             .show(ctx, |ui| {
                 let canvas_rect = ui.max_rect();
                 let canvas = ui.allocate_rect(canvas_rect, Sense::click_and_drag());
-                if !modal_active {
-                    canvas.context_menu(|ui| {
-                        if ui.button("Paste").clicked() {
-                            self.handle_paste();
-                            ui.close();
-                        }
-                        if ui.button("Load…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("AnimRef scene", &["purgif"])
-                                .pick_file()
-                            {
-                                let result = self.load_scene(&path);
-                                self.capture_result(result);
-                            }
-                            ui.close();
-                        }
-                        if ui.button("Save").clicked() {
-                            let result = self.save_scene();
-                            self.capture_result(result);
-                            ui.close();
-                        }
-                        if ui.button("Save As…").clicked() {
-                            let result = self.save_scene_as();
-                            self.capture_result(result);
-                            ui.close();
-                        }
-                        if ui.button("New").clicked() {
-                            self.new_scene();
-                            ui.close();
-                        }
-                        ui.menu_button("Recent", |ui| {
-                            for path in self.recent.clone().into_iter().rev() {
-                                if ui.button(path.to_string_lossy()).clicked() {
-                                    let result = self.load_scene(&path);
-                                    self.capture_result(result);
-                                    ui.close();
-                                }
-                            }
-                        });
-                        ui.menu_button("Window", |ui| {
-                            let mut always_on_top = self.always_on_top;
-                            if ui.checkbox(&mut always_on_top, "Always on top").changed() {
-                                self.always_on_top = always_on_top;
-                                ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
-                                    if always_on_top {
-                                        WindowLevel::AlwaysOnTop
-                                    } else {
-                                        WindowLevel::Normal
-                                    },
-                                ));
-                            }
-                            if ui.button("Toggle maximize").clicked() {
-                                let maximized =
-                                    ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                                ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
-                                ui.close();
-                            }
-                            if ui.button("Minimize").clicked() {
-                                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-                                ui.close();
-                            }
-                            if ui.button("Close").clicked() {
-                                ctx.send_viewport_cmd(ViewportCommand::Close);
-                            }
-                        });
-                        if let Some(index) =
-                            self.selected.filter(|i| *i < self.scene.elements.len())
-                            && self.scene.elements[index].is_video()
-                            && ui
-                                .button(if self.edit_video_id.is_some() {
-                                    "Close edit video"
-                                } else {
-                                    "Edit video"
-                                })
-                                .clicked()
-                        {
-                            if self.edit_video_id.is_some() {
-                                self.exit_video_edit();
-                            } else {
-                                let id = self.scene.elements[index].id;
-                                self.enter_video_edit(id);
-                            }
-                            ui.close();
-                        }
-                    });
-                }
                 let painter = ui.painter_at(canvas_rect);
-                let (space_pan, ctrl_space_zoom, right_drag) = ctx.input(|i| {
+                self.paint_grid(&painter, canvas_rect);
+                let pointer = ctx.input(|input| input.pointer.interact_pos());
+                let overlay_blocks = modal_active
+                    || self.context_menu_pos.is_some()
+                    || pointer.is_some_and(|position| self.hovered_header && position.y <= 42.0)
+                    || pointer.is_some_and(|position| {
+                        self.selected_id()
+                            .is_some_and(|id| self.playback_sessions.contains_key(&id))
+                            && position.y >= canvas_rect.bottom() - 70.0
+                    });
+                let (space_pan, ctrl_space_zoom) = ctx.input(|input| {
                     (
-                        i.pointer.primary_down() && i.key_down(Key::Space) && !i.modifiers.ctrl,
-                        i.pointer.primary_down() && i.key_down(Key::Space) && i.modifiers.ctrl,
-                        i.pointer.button_down(egui::PointerButton::Secondary),
+                        input.pointer.primary_down()
+                            && input.key_down(Key::Space)
+                            && !input.modifiers.ctrl,
+                        input.pointer.primary_down()
+                            && input.key_down(Key::Space)
+                            && input.modifiers.ctrl,
                     )
                 });
-                if self.scene.elements.is_empty() {
-                    painter.text(
-                        canvas_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "Drop images, GIFs, videos, or paste a YouTube URL",
-                        FontId::proportional(18.0),
-                        Color32::from_gray(130),
-                    );
-                }
-                let pointer = ctx.input(|i| i.pointer.interact_pos());
-                let mut bring_front_id = None;
+                let mut bring_front = None;
                 for index in 0..self.scene.elements.len() {
-                    let editing_this = self.edit_video_id == Some(self.scene.elements[index].id);
-                    if self.edit_video_id.is_some() && !editing_this {
-                        continue;
-                    }
-                    let (world_x, world_y, width, height) = {
+                    let (world_x, world_y, width, height, id) = {
                         let element = &self.scene.elements[index];
                         (
                             element.x,
                             element.y,
                             element.width.unwrap_or(320.0),
                             element.height.unwrap_or(200.0),
+                            element.id,
                         )
                     };
-                    let scale = self.scene.current_scale;
+                    let scale = self.scene.current_scale.max(0.01);
                     let origin =
                         canvas_rect.min + Vec2::new(self.scene.translate.x, self.scene.translate.y);
-                    let min = if editing_this {
-                        canvas_rect.min + Vec2::splat(8.0)
-                    } else {
-                        origin + Vec2::new(world_x, world_y) * scale
-                    };
-                    let rect = if editing_this {
-                        canvas_rect.shrink(8.0)
-                    } else {
-                        Rect::from_min_size(min, Vec2::new(width, height) * scale)
-                    };
-                    let response = ui.interact(rect, ui.id().with(index), Sense::click_and_drag());
-                    let selected_item = self.selected == Some(index) && !editing_this;
+                    let rect = Rect::from_min_size(
+                        origin + Vec2::new(world_x, world_y) * scale,
+                        Vec2::new(width, height) * scale,
+                    );
+                    let response =
+                        ui.interact(rect, ui.id().with(("element", id)), Sense::click_and_drag());
+                    let selected = self.selected_id() == Some(id);
                     let handle_rect = Rect::from_min_size(
                         rect.right_bottom() - Vec2::splat(12.0),
                         Vec2::splat(12.0),
                     );
-                    let handle = if !modal_active && selected_item {
-                        Some(ui.interact(
-                            handle_rect,
-                            ui.id().with(("resize", index)),
-                            Sense::drag(),
-                        ))
-                    } else {
-                        None
-                    };
-                    if !modal_active && response.clicked() {
+                    let handle = selected.then(|| {
+                        ui.interact(handle_rect, ui.id().with(("resize", id)), Sense::drag())
+                    });
+                    if !overlay_blocks && response.clicked_by(egui::PointerButton::Primary) {
                         self.selected = Some(index);
-                        bring_front_id = Some(self.scene.elements[index].id);
+                        bring_front = Some(id);
                     }
-                    if !modal_active
-                        && response.dragged()
-                        && !handle.as_ref().is_some_and(|r| r.dragged())
-                        && !editing_this
+                    if !overlay_blocks
+                        && response.dragged_by(egui::PointerButton::Primary)
+                        && !handle
+                            .as_ref()
+                            .is_some_and(|handle| handle.dragged_by(egui::PointerButton::Primary))
                         && !space_pan
                         && !ctrl_space_zoom
                     {
-                        let delta = ctx.input(|i| i.pointer.delta()) / scale;
-                        self.scene.elements[index].x += delta.x;
-                        self.scene.elements[index].y += delta.y;
-                        self.selected = Some(index);
-                        ctx.request_repaint();
-                    }
-                    if !modal_active
-                        && selected_item
-                        && handle.as_ref().is_some_and(|r| r.dragged())
-                    {
-                        let delta = ctx.input(|i| i.pointer.delta()) / scale;
+                        let delta = ctx.input(|input| input.pointer.delta()) / scale;
                         let element = &mut self.scene.elements[index];
+                        element.x += delta.x;
+                        element.y += delta.y;
+                        self.selected = Some(index);
+                    }
+                    if !overlay_blocks
+                        && self.scene.grid.enabled
+                        && response.drag_stopped_by(egui::PointerButton::Primary)
+                    {
+                        let spacing = self.scene.grid.spacing.max(1.0);
+                        let element = &mut self.scene.elements[index];
+                        element.x = (element.x / spacing).round() * spacing;
+                        element.y = (element.y / spacing).round() * spacing;
+                    }
+                    if !overlay_blocks
+                        && selected
+                        && handle
+                            .as_ref()
+                            .is_some_and(|handle| handle.dragged_by(egui::PointerButton::Primary))
+                    {
+                        let delta = ctx.input(|input| input.pointer.delta()) / scale;
                         let aspect = (width / height).max(0.01);
+                        let element = &mut self.scene.elements[index];
                         if (delta.x / width.max(1.0)).abs() >= (delta.y / height.max(1.0)).abs() {
                             let new_width = (width + delta.x).max(10.0);
                             element.width = Some(new_width);
@@ -1462,14 +2126,24 @@ impl AnimRefApp {
                             element.height = Some(new_height);
                             element.width = Some((new_height * aspect).max(10.0));
                         }
-                        ctx.request_repaint();
                     }
-                    self.paint_element(&painter, index, rect, ctx);
-                    if self.selected == Some(index) && !editing_this {
-                        let handle_rect = Rect::from_min_size(
-                            rect.right_bottom() - Vec2::splat(12.0),
-                            Vec2::splat(12.0),
-                        );
+                    if !overlay_blocks
+                        && selected
+                        && self.scene.grid.enabled
+                        && handle.as_ref().is_some_and(|handle| {
+                            handle.drag_stopped_by(egui::PointerButton::Primary)
+                        })
+                    {
+                        let spacing = self.scene.grid.spacing.max(1.0);
+                        let element = &mut self.scene.elements[index];
+                        let aspect = (width / height).max(0.01);
+                        let new_width =
+                            (element.width.unwrap_or(width) / spacing).round().max(1.0) * spacing;
+                        element.width = Some(new_width);
+                        element.height = Some((new_width / aspect).max(10.0));
+                    }
+                    self.paint_element(&painter, index, rect);
+                    if selected {
                         painter.rect_stroke(
                             rect,
                             0.0,
@@ -1478,29 +2152,28 @@ impl AnimRefApp {
                         );
                         painter.rect_filled(handle_rect, 1.0, Color32::from_rgb(45, 165, 210));
                     }
-                    if self.scene.elements[index].is_video() {
-                        if let Some(error) = self.video_errors.get(&self.video_key(index)) {
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                error,
-                                FontId::proportional(13.0),
-                                Color32::LIGHT_RED,
-                            );
-                        } else if self.scene.elements[index].media_type == "youtube"
-                            && self.scene.elements[index].display_path().is_none()
-                        {
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "Select a source section and download",
-                                FontId::proportional(15.0),
-                                Color32::LIGHT_GRAY,
-                            );
-                        }
+                    if let Some(error) = self.playback_errors.get(&id) {
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            error,
+                            FontId::proportional(13.0),
+                            Color32::LIGHT_RED,
+                        );
+                    }
+                    if self.scene.elements[index].media_type == "youtube"
+                        && self.scene.elements[index].display_path().is_none()
+                    {
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Choose a section to download",
+                            FontId::proportional(15.0),
+                            Color32::LIGHT_GRAY,
+                        );
                     }
                 }
-                if let Some(id) = bring_front_id
+                if let Some(id) = bring_front
                     && let Some(index) = self
                         .scene
                         .elements
@@ -1509,77 +2182,100 @@ impl AnimRefApp {
                 {
                     self.bring_to_front(index);
                 }
-                if !modal_active
-                    && (canvas_rect.contains(pointer.unwrap_or_default())
-                        && (space_pan
-                            || ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle))))
+                if !overlay_blocks
+                    && canvas.clicked_by(egui::PointerButton::Primary)
+                    && bring_front.is_none()
                 {
-                    let delta = ctx.input(|i| i.pointer.delta());
+                    self.selected = None;
+                }
+                let pointer_in_canvas = pointer.is_some_and(|point| canvas_rect.contains(point));
+                if !overlay_blocks
+                    && pointer_in_canvas
+                    && (space_pan
+                        || ctx
+                            .input(|input| input.pointer.button_down(egui::PointerButton::Middle)))
+                {
+                    let delta = ctx.input(|input| input.pointer.delta());
                     self.scene.translate.x += delta.x;
                     self.scene.translate.y += delta.y;
                 }
-                if !modal_active && right_drag && pointer.is_some_and(|p| canvas_rect.contains(p)) {
-                    let delta = ctx.input(|i| i.pointer.delta());
-                    if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-                        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(outer.min + delta));
-                    }
-                }
-                if let Some(pos) = pointer {
-                    let scroll = ctx.input(|i| i.raw_scroll_delta.y);
-                    if !modal_active
-                        && self.edit_video_id.is_none()
-                        && scroll != 0.0
-                        && canvas_rect.contains(pos)
-                    {
-                        let old_scale = self.scene.current_scale;
-                        let new_scale = (old_scale * (1.0 + scroll * 0.001)).clamp(0.01, 2.0);
-                        let anchor = pos
+                if !overlay_blocks
+                    && let Some(position) =
+                        pointer.filter(|position| canvas_rect.contains(*position))
+                {
+                    let scroll = ctx.input(|input| input.raw_scroll_delta.y);
+                    if scroll != 0.0 {
+                        let old = self.scene.current_scale;
+                        let new = (old * (1.0 + scroll * 0.001)).clamp(0.01, 2.0);
+                        let anchor = position
                             - canvas_rect.min
                             - Vec2::new(self.scene.translate.x, self.scene.translate.y);
-                        let factor = 1.0 - new_scale / old_scale;
+                        let factor = 1.0 - new / old;
                         self.scene.translate.x += anchor.x * factor;
                         self.scene.translate.y += anchor.y * factor;
-                        self.scene.current_scale = new_scale;
+                        self.scene.current_scale = new;
                         ctx.request_repaint();
                     }
-                    if !modal_active
-                        && self.edit_video_id.is_none()
-                        && ctrl_space_zoom
-                        && canvas_rect.contains(pos)
-                    {
-                        let delta = ctx.input(|i| i.pointer.delta().x);
+                    if ctrl_space_zoom {
+                        let delta = ctx.input(|input| input.pointer.delta().x);
                         if delta != 0.0 {
-                            let old_scale = self.scene.current_scale;
-                            let new_scale =
-                                (old_scale + delta / 120.0 * old_scale / 2.0).clamp(0.01, 2.0);
-                            let anchor = pos
+                            let old = self.scene.current_scale;
+                            let new = (old + delta / 120.0 * old / 2.0).clamp(0.01, 2.0);
+                            let anchor = position
                                 - canvas_rect.min
                                 - Vec2::new(self.scene.translate.x, self.scene.translate.y);
-                            let factor = 1.0 - new_scale / old_scale;
+                            let factor = 1.0 - new / old;
                             self.scene.translate.x += anchor.x * factor;
                             self.scene.translate.y += anchor.y * factor;
-                            self.scene.current_scale = new_scale;
+                            self.scene.current_scale = new;
                         }
                     }
                 }
-                if !modal_active && ctx.input(|i| !i.raw.dropped_files.is_empty()) {
-                    for file in ctx.input(|i| i.raw.dropped_files.clone()) {
+                if !modal_active && ctx.input(|input| !input.raw.dropped_files.is_empty()) {
+                    for file in ctx.input(|input| input.raw.dropped_files.clone()) {
                         if let Some(path) = file.path {
                             self.import_path(&path);
                         }
                     }
                 }
-                let _ = canvas; // reserve canvas input surface for panning, drops, and viewport drag
+                let _ = canvas;
             });
     }
 
-    fn paint_element(
-        &mut self,
-        painter: &egui::Painter,
-        index: usize,
-        rect: Rect,
-        ctx: &EguiContext,
-    ) {
+    fn paint_grid(&self, painter: &egui::Painter, rect: Rect) {
+        if !self.scene.grid.enabled {
+            return;
+        }
+        let mut step = self.scene.grid.spacing.max(1.0) * self.scene.current_scale.max(0.01);
+        while step < 18.0 {
+            step *= 2.0;
+        }
+        if step > 240.0 {
+            return;
+        }
+        let origin = rect.min + Vec2::new(self.scene.translate.x, self.scene.translate.y);
+        let first_x = rect.left() + (origin.x - rect.left()).rem_euclid(step);
+        let first_y = rect.top() + (origin.y - rect.top()).rem_euclid(step);
+        let color = Color32::from_gray(48);
+        let mut x = first_x;
+        while x < rect.right() {
+            painter.line_segment(
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                Stroke::new(1.0_f32, color),
+            );
+            x += step;
+        }
+        let mut y = first_y;
+        while y < rect.bottom() {
+            painter.line_segment(
+                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                Stroke::new(1.0_f32, color),
+            );
+            y += step;
+        }
+    }
+
+    fn paint_element(&mut self, painter: &egui::Painter, index: usize, rect: Rect) {
         let element = &self.scene.elements[index];
         if element.media_type == "text" {
             let desired = (rect.height() / 2.2).clamp(0.01, 72.0);
@@ -1612,9 +2308,9 @@ impl AnimRefApp {
                 .galley(pos, fitted, Color32::WHITE);
             return;
         }
-        if element.is_video() {
-            let key = self.video_key(index);
-            if let Some(texture) = self.video_textures.get(&key) {
+        let is_animated = element.is_video() || self.playback_sessions.contains_key(&element.id);
+        if is_animated {
+            if let Some(texture) = self.playback_textures.get(&element.id) {
                 let video_rect = contain_rect(rect, texture.size_vec2());
                 painter.image(
                     texture.id(),
@@ -1625,30 +2321,19 @@ impl AnimRefApp {
             } else {
                 painter.rect_filled(rect, 0.0, Color32::from_gray(18));
             }
+            if let Some(error) = self.playback_errors.get(&element.id) {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    error,
+                    FontId::proportional(13.0),
+                    Color32::LIGHT_RED,
+                );
+            }
             return;
         }
         let key = element.id.to_string();
-        if let Some(gif) = self.gif_assets.get(&key) {
-            let elapsed = gif.started.elapsed().as_secs_f32();
-            let total = gif.total_duration.as_secs_f32().max(0.02);
-            let mut tick = elapsed % total;
-            let mut frame = 0;
-            for (index, (_, delay)) in gif.frames.iter().enumerate() {
-                if tick < delay.as_secs_f32() {
-                    frame = index;
-                    break;
-                }
-                tick -= delay.as_secs_f32();
-            }
-            let texture = &gif.frames[frame].0;
-            painter.image(
-                texture.id(),
-                rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-            ctx.request_repaint_after(Duration::from_millis(25));
-        } else if let Some(texture) = self.image_assets.get(&key) {
+        if let Some(texture) = self.image_assets.get(&key) {
             painter.image(
                 texture.id(),
                 rect,
@@ -1667,10 +2352,6 @@ impl AnimRefApp {
         } else {
             painter.rect_filled(rect, 2.0, Color32::from_gray(55));
         }
-    }
-
-    fn video_key(&self, index: usize) -> String {
-        self.scene.elements[index].id.to_string()
     }
 
     fn bring_to_front(&mut self, index: usize) {
@@ -1739,7 +2420,7 @@ impl AnimRefApp {
             if let Some(event_rx) = event_rx {
                 while let Ok(event) = event_rx.try_recv() {
                     match event {
-                        DownloadEvent::Progress(progress) => dialog.progress = progress,
+                        DownloadEvent::Progress(progress) => dialog.progress = Some(progress),
                         DownloadEvent::Finished(path) => {
                             completed_path = Some(path);
                             job_finished = true;
@@ -1778,13 +2459,22 @@ impl AnimRefApp {
         let Some(dialog) = self.show_youtube.as_mut() else {
             return;
         };
-        let mut close = false;
+        let mut open = true;
+        let dialog_width = (ctx.screen_rect().width() - 24.0).clamp(220.0, 430.0);
         egui::Window::new("Prepare YouTube clip")
+            .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .default_width(430.0)
+            .resizable(true)
+            .default_width(dialog_width)
+            .min_width(dialog_width.min(270.0))
+            .max_width(dialog_width)
             .show(ctx, |ui| {
-                ui.label("Paste a YouTube link, inspect its metadata, then choose the source range to download.");
+                let body_height = (ctx.screen_rect().height() - 92.0).max(112.0);
+                egui::ScrollArea::vertical()
+                    .max_height(body_height)
+                    .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label("Inspect a link, then choose a source range.");
                 let mut url_changed = false;
                 ui.add_enabled_ui(dialog.job.is_none() && !dialog.metadata_waiting, |ui| {
                     url_changed = ui.text_edit_singleline(&mut dialog.url).changed();
@@ -1811,14 +2501,36 @@ impl AnimRefApp {
                     ui.label(egui::RichText::new(&metadata.title).strong());
                     ui.label(format!("Source duration: {:.2}s", metadata.duration.unwrap_or(0.0)));
                     ui.add_enabled_ui(dialog.job.is_none(), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Start"); ui.text_edit_singleline(&mut dialog.start_text);
-                            ui.label("End"); ui.text_edit_singleline(&mut dialog.end_text);
-                        });
+                        ui.label("Start");
+                        ui.add_sized([ui.available_width(), 24.0], egui::TextEdit::singleline(&mut dialog.start_text));
+                        ui.label("End");
+                        ui.add_sized([ui.available_width(), 24.0], egui::TextEdit::singleline(&mut dialog.end_text));
                     });
-                    ui.label("Times can be seconds or HH:MM:SS. The source video is not downloaded until you click Download section.");
+                    ui.label("Enter seconds or HH:MM:SS.")
+                        .on_hover_text("The source video is downloaded only after you click Download selected section.");
                     if let Some(job) = &dialog.job {
-                        ui.add(egui::ProgressBar::new(dialog.progress / 100.0).show_percentage());
+                        if let Some(progress) = &dialog.progress {
+                            let stage = match progress.stage {
+                                DownloadStage::Preparing => "Preparing",
+                                DownloadStage::Fetching => "Fetching",
+                                DownloadStage::Finalizing => "Finalizing",
+                                DownloadStage::Verifying => "Verifying",
+                                DownloadStage::Finished => "Finished",
+                            };
+                            if matches!(progress.stage, DownloadStage::Fetching)
+                                && let (Some(elapsed), Some(target)) = (progress.elapsed_seconds, progress.target_seconds)
+                                && target > 0.0
+                            {
+                                ui.label("Section processing");
+                                ui.add(egui::ProgressBar::new((elapsed / target).clamp(0.0, 1.0) as f32).text(format!("{elapsed:.1}/{target:.1}s")));
+                            } else {
+                                ui.horizontal(|ui| { ui.spinner(); ui.label(stage); });
+                            }
+                            if let Some(bytes) = &progress.output_bytes { ui.label(format!("Output: {:.1} MB", *bytes as f64 / 1_000_000.0)); }
+                            if let Some(detail) = &progress.detail { ui.label(detail); }
+                        } else {
+                            ui.horizontal(|ui| { ui.spinner(); ui.label("Preparing"); });
+                        }
                         if ui.button("Cancel download").clicked() { job.cancel(); }
                     } else if ui.button("Download selected section").clicked() {
                         let start = parse_time(&dialog.start_text);
@@ -1827,7 +2539,7 @@ impl AnimRefApp {
                         if let (Some(start), Some(end)) = (start, end) {
                             if start >= 0.0 && start < end && end <= duration + 0.01 {
                                 match youtube::begin_download(dialog.url.clone(), metadata.id.clone(), start, end, "best".into()) {
-                                    Ok(job) => { dialog.job = Some(job); dialog.progress = 0.0; dialog.error = None; }
+                                    Ok(job) => { dialog.job = Some(job); dialog.progress = None; dialog.error = None; }
                                     Err(error) => dialog.error = Some(error.to_string()),
                                 }
                             } else { dialog.error = Some("Choose a valid range within the source duration.".into()); }
@@ -1835,10 +2547,17 @@ impl AnimRefApp {
                     }
                 }
                 if let Some(error) = &dialog.error { ui.colored_label(Color32::LIGHT_RED, error); }
-                ui.separator();
-                if ui.button("Close").clicked() { close = true; }
+                    });
             });
-        if close {
+        if !open {
+            if let Some(dialog) = self.show_youtube.as_ref() {
+                if let Some(job) = &dialog.job {
+                    job.cancel();
+                }
+                if let Some(job) = &dialog.metadata_job {
+                    job.cancel();
+                }
+            }
             self.show_youtube = None;
         }
         ctx.request_repaint_after(Duration::from_millis(75));
@@ -1877,9 +2596,7 @@ impl AnimRefApp {
             return;
         }
         if let Some(index) = target {
-            let key = self.scene.elements[index].id.to_string();
-            self.video_players.remove(&key);
-            self.video_textures.remove(&key);
+            self.clear_item_cache(self.scene.elements[index].id);
             let element = &mut self.scene.elements[index];
             element.path = url.clone();
             element.media_type = "youtube".into();
@@ -1924,20 +2641,10 @@ impl AnimRefApp {
                     }
                 });
         }
-        if self.show_help {
-            egui::Window::new("AnimRef controls").collapsible(false).resizable(false).show(ctx, |ui| {
-                ui.label("Drag items to move them. Drag the blue lower corner to resize.");
-                ui.label("Hold Space and drag, or use the middle mouse button, to pan.");
-                ui.label("Use the wheel to zoom around the pointer.");
-        ui.label("Ctrl+L opens, Ctrl+S saves, Ctrl+N starts a scene, Delete removes an item.");
-                ui.label("Paste a YouTube URL to inspect it and choose a section before download.");
-                if ui.button("Close").clicked() { self.show_help = false; }
-            });
-        }
     }
 
     fn begin_window_resize(&self, ctx: &EguiContext) {
-        if self.show_youtube.is_some() || self.show_text_dialog || self.show_help {
+        if self.show_youtube.is_some() || self.show_text_dialog || self.context_menu_pos.is_some() {
             return;
         }
         let (rect, pointer, pressed) = ctx.input(|i| {
@@ -1977,55 +2684,71 @@ impl AnimRefApp {
 
     fn handle_shortcuts(&mut self, ctx: &EguiContext) {
         let wants_keyboard = ctx.wants_keyboard_input();
+        let (native_copy, native_paste) = ctx.input(|input| {
+            let copy = input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy));
+            let paste = input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)));
+            (copy, paste)
+        });
+        let win32_paste = window_host::take_paste_request();
+        if !wants_keyboard {
+            if native_copy {
+                self.queue_action(AppAction::CopySelected);
+            }
+            if native_paste || win32_paste {
+                self.queue_action(AppAction::Paste);
+            }
+            if native_copy || native_paste {
+                ctx.input_mut(|input| {
+                    input
+                        .events
+                        .retain(|event| !matches!(event, egui::Event::Copy | egui::Event::Paste(_)))
+                });
+            }
+        }
         let save_as = !wants_keyboard && consume_ctrl_shortcut(ctx, Key::S, true);
         if save_as {
-            let result = self.save_scene_as();
-            self.capture_result(result);
+            self.queue_action(AppAction::SaveAs);
+        } else if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::S, false) {
+            self.queue_action(AppAction::Save);
         }
-        if !wants_keyboard
-            && consume_ctrl_shortcut(ctx, Key::L, false)
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("AnimRef scene", &["purgif"])
-                .pick_file()
-        {
-            let result = self.load_scene(&path);
-            self.capture_result(result);
+        if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::L, false) {
+            self.queue_action(AppAction::OpenScene);
         }
         if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::W, false) {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+            self.queue_action(AppAction::Close);
         }
         if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::F, false) {
-            let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-            ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+            self.queue_action(AppAction::ToggleMaximize);
         }
         if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::M, false) {
-            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-        }
-        if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::H, false) {
-            self.show_help = true;
-        }
-        if !save_as && !wants_keyboard && consume_ctrl_shortcut(ctx, Key::S, false) {
-            let result = self.save_scene();
-            self.capture_result(result);
+            self.queue_action(AppAction::Minimize);
         }
         if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::N, false) {
-            self.new_scene();
+            self.queue_action(AppAction::NewScene);
         }
-        if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::V, false) {
-            self.handle_paste();
+        if !wants_keyboard && consume_ctrl_shortcut(ctx, Key::G, false) {
+            self.queue_action(AppAction::ToggleGrid);
         }
-        if ctx.input(|i| i.key_pressed(Key::Escape)) && self.edit_video_id.is_some() {
-            self.exit_video_edit();
+        if !wants_keyboard && ctx.input(|input| input.key_pressed(Key::Delete)) {
+            self.queue_action(AppAction::DeleteSelected);
         }
-        if ctx.input(|i| i.key_pressed(Key::Delete))
-            && !wants_keyboard
-            && let Some(index) = self
-                .selected
-                .take()
-                .filter(|i| *i < self.scene.elements.len())
-        {
-            let removed = self.scene.elements.remove(index);
-            self.clear_item_cache(removed.id);
+        if ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.context_menu_pos = None;
+        }
+        if !wants_keyboard && ctx.input(|input| input.key_pressed(Key::K)) {
+            self.queue_action(AppAction::PlayPause);
+        }
+        if !wants_keyboard && ctx.input(|input| input.key_pressed(Key::ArrowLeft)) {
+            self.queue_action(AppAction::StepAnimation(-1));
+        }
+        if !wants_keyboard && ctx.input(|input| input.key_pressed(Key::ArrowRight)) {
+            self.queue_action(AppAction::StepAnimation(1));
         }
     }
 
@@ -2034,122 +2757,83 @@ impl AnimRefApp {
             self.status = format!("{error:#}");
         }
     }
-
-    fn draw_edit_timeline(&mut self, ctx: &EguiContext) {
-        let Some(id) = self.edit_video_id else {
-            return;
-        };
-        let Some(index) = self
-            .scene
-            .elements
-            .iter()
-            .position(|element| element.id == id)
-        else {
-            self.exit_video_edit();
-            return;
-        };
-        let element = &self.scene.elements[index];
-        let is_youtube = element.media_type == "youtube";
-        let active = if is_youtube {
-            element.active_playback_pair()
-        } else {
-            element.active_loop_pair
-        };
-        let duration = element.media_duration.unwrap_or(0.0);
-        let element_id = element.id;
-        let player_key = element_id.to_string();
-        let players = &self.video_players;
-        let textures = &mut self.video_textures;
-        let pending_seek = &mut self.pending_video_seek;
-        let mut done = false;
-        egui::TopBottomPanel::bottom("edit-timeline")
-            .exact_height(58.0)
-            .frame(egui::Frame::new().fill(Color32::from_rgb(48, 44, 51)))
-            .show(ctx, |ui| {
-                let element = &mut self.scene.elements[index];
-                let pairs =
-                    if element.media_type == "youtube" && !element.playback_loop_pairs.is_empty() {
-                        &mut element.playback_loop_pairs
-                    } else {
-                        &mut element.loop_pairs
-                    };
-                if pairs.is_empty() {
-                    pairs.push([0.0, 100.0]);
-                }
-                let active = active.min(pairs.len().saturating_sub(1));
-                ui.horizontal(|ui| {
-                    ui.strong("Loop range");
-                    let mut playhead = players
-                        .get(&player_key)
-                        .map(|player| player.playhead())
-                        .unwrap_or(0.0);
-                    if duration > 0.0 {
-                        let position_before = playhead;
-                        ui.add(
-                            egui::Slider::new(&mut playhead, 0.0..=duration)
-                                .text("Position")
-                                .show_value(true),
-                        );
-                        if (playhead - position_before).abs() > 0.001 {
-                            pending_seek.insert(element_id, playhead);
-                            // Dropping the current player stops its FFmpeg process.
-                            // Remove it after this panel has finished borrowing the map.
-                        }
-                    }
-                    let pair = &mut pairs[active];
-                    let before = *pair;
-                    ui.add(
-                        egui::Slider::new(&mut pair[0], 0.0..=99.0)
-                            .text("A")
-                            .show_value(true),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut pair[1], 1.0..=100.0)
-                            .text("B")
-                            .show_value(true),
-                    );
-                    if pair[0] >= pair[1] {
-                        pair[0] = (pair[1] - 1.0).max(0.0);
-                    }
-                    if *pair != before && duration > 0.0 {
-                        let seek =
-                            (duration * pair[0] / 100.0).clamp(0.0, (duration - 0.01).max(0.0));
-                        pending_seek.insert(element_id, seek);
-                    }
-                    if ui.button("Done").clicked() {
-                        done = true;
-                    }
-                });
-            });
-        if pending_seek.contains_key(&element_id) {
-            self.video_players.remove(&player_key);
-            textures.remove(&player_key);
-        }
-        if done {
-            self.exit_video_edit();
-        }
-    }
 }
 
 impl eframe::App for AnimRefApp {
-    fn update(&mut self, ctx: &EguiContext, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &EguiContext, frame: &mut eframe::Frame) {
         self.update_diagnostics(ctx);
         self.handle_shortcuts(ctx);
+        let (right_pressed, right_held, right_released, local_position) = ctx.input(|input| {
+            (
+                input.pointer.button_pressed(egui::PointerButton::Secondary),
+                input.pointer.button_down(egui::PointerButton::Secondary),
+                input
+                    .pointer
+                    .button_released(egui::PointerButton::Secondary),
+                input.pointer.interact_pos(),
+            )
+        });
+        let start_allowed = self.show_youtube.is_none()
+            && !self.show_text_dialog
+            && self.context_menu_pos.is_none();
+        if let Some(position) = self.window_host.update(
+            frame,
+            right_pressed,
+            right_held,
+            right_released,
+            local_position,
+            start_allowed,
+        ) && self.show_youtube.is_none()
+            && !self.show_text_dialog
+        {
+            self.select_under_pointer(position);
+            self.context_menu_pos = Some(position);
+        }
+        self.run_actions(ctx);
+        if let Some(result) =
+            self.dialogs
+                .advance(ctx, frame, self.update_count, self.always_on_top)
+        {
+            self.handle_dialog_result(result);
+        }
         self.drain_remote_imports();
-        self.draw_top_bar(ctx);
-        self.draw_inspector(ctx);
-        self.draw_edit_timeline(ctx);
-        egui::TopBottomPanel::bottom("status")
-            .exact_height(22.0)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new(&self.status).small().weak());
-            });
-        self.draw_canvas(ctx);
+        self.draw_canvas_surface(ctx);
+        self.draw_hover_header(ctx);
+        self.draw_selection_bar(ctx);
+        self.draw_context_menu(ctx);
         self.draw_youtube_dialog(ctx);
         self.draw_other_windows(ctx);
+        self.draw_toast(ctx);
         self.begin_window_resize(ctx);
         ctx.request_repaint_after(Duration::from_millis(33));
     }
+}
+
+impl AnimRefApp {
+    fn select_under_pointer(&mut self, pointer: Pos2) {
+        let origin = ctx_origin_for(&self.scene, pointer);
+        let scale = self.scene.current_scale.max(0.01);
+        let mut selected = None;
+        for (index, element) in self.scene.elements.iter().enumerate().rev() {
+            let rect = Rect::from_min_size(
+                origin + Vec2::new(element.x, element.y) * scale,
+                Vec2::new(
+                    element.width.unwrap_or(320.0),
+                    element.height.unwrap_or(200.0),
+                ) * scale,
+            );
+            if rect.contains(pointer) {
+                selected = Some(index);
+                break;
+            }
+        }
+        self.selected = selected;
+    }
+}
+
+fn ctx_origin_for(scene: &Scene, pointer: Pos2) -> Pos2 {
+    let _ = pointer;
+    Pos2::ZERO + Vec2::new(scene.translate.x, scene.translate.y)
 }
 
 fn consume_ctrl_shortcut(ctx: &EguiContext, key: Key, shift: bool) -> bool {
@@ -2161,15 +2845,35 @@ fn consume_ctrl_shortcut(ctx: &EguiContext, key: Key, shift: bool) -> bool {
     ctx.input_mut(|input| input.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)))
 }
 
-fn read_image_source(path: &str) -> Result<Vec<u8>> {
-    if let Some(rest) = path.strip_prefix("data:") {
-        let (metadata, payload) = rest.split_once(',').context("Invalid image data URL")?;
-        if metadata.contains(";base64") {
-            return Ok(base64::engine::general_purpose::STANDARD.decode(payload)?);
-        }
-        return Ok(payload.as_bytes().to_vec());
-    }
-    fs::read(path).with_context(|| format!("Could not read image {}", path))
+fn copy_file_atomically(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    fs::copy(source, temporary.path())
+        .with_context(|| format!("Could not stage {}", source.display()))?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(destination)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Could not replace {}", destination.display()))?;
+    Ok(())
+}
+
+fn write_file_atomically(destination: &Path, contents: &[u8]) -> Result<()> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut temporary, contents)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(destination)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Could not replace {}", destination.display()))?;
+    Ok(())
 }
 
 fn resolve_scene_asset_paths(scene: &mut Scene, parent: &Path) {
@@ -2215,6 +2919,87 @@ fn is_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
+fn cached_youtube_path(element: &Element) -> Option<&Path> {
+    (element.media_type == "youtube")
+        .then_some(element.cached_path.as_deref())
+        .flatten()
+        .filter(|path| path.is_file())
+}
+
+fn remote_playback_url(element: &Element) -> Option<&str> {
+    (element.media_type == "video" && is_http_url(&element.path)).then_some(element.path.as_str())
+}
+
+fn ellipsized_galley(
+    painter: &egui::Painter,
+    text: &str,
+    font_id: egui::FontId,
+    color: Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let full = painter.layout_no_wrap(text.to_owned(), font_id.clone(), color);
+    if full.size().x <= max_width {
+        return full;
+    }
+    let characters: Vec<char> = text.chars().collect();
+    let mut low = 0;
+    let mut high = characters.len();
+    let mut best = painter.layout_no_wrap("…".to_owned(), font_id.clone(), color);
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let prefix: String = characters.iter().take(middle).collect();
+        let candidate = painter.layout_no_wrap(format!("{prefix}…"), font_id.clone(), color);
+        if candidate.size().x <= max_width {
+            best = candidate;
+            low = middle + 1;
+        } else if middle == 0 {
+            break;
+        } else {
+            high = middle - 1;
+        }
+    }
+    best
+}
+
+fn context_menu_row(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), sense);
+    let visuals = if response.is_pointer_button_down_on() {
+        &ui.visuals().widgets.active
+    } else if response.hovered() {
+        &ui.visuals().widgets.hovered
+    } else {
+        &ui.visuals().widgets.inactive
+    };
+    if response.hovered() || response.is_pointer_button_down_on() {
+        ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+    }
+    let color = if enabled {
+        visuals.text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let galley = ellipsized_galley(
+        ui.painter(),
+        label,
+        egui::FontId::proportional(15.0),
+        color,
+        (rect.width() - 16.0).max(1.0),
+    );
+    ui.painter()
+        .with_clip_rect(rect.shrink2(Vec2::new(7.0, 0.0)))
+        .galley(
+            Pos2::new(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5),
+            galley,
+            color,
+        );
+    response
+}
+
 fn remote_url_is_video(value: &str) -> bool {
     let extension = value
         .split(['?', '#'])
@@ -2237,12 +3022,6 @@ fn contain_rect(bounds: Rect, source_size: Vec2) -> Rect {
     let scale = (bounds.width() / source_size.x).min(bounds.height() / source_size.y);
     let size = source_size * scale;
     Rect::from_center_size(bounds.center(), size)
-}
-
-fn is_gif_source(path: &str, bytes: &[u8]) -> bool {
-    path.to_ascii_lowercase().ends_with(".gif")
-        || bytes.starts_with(b"GIF87a")
-        || bytes.starts_with(b"GIF89a")
 }
 
 fn clipboard_path(text: &str) -> Option<PathBuf> {
@@ -2373,22 +3152,14 @@ mod tests {
             recent: Vec::new(),
             status: String::new(),
             always_on_top: true,
-            show_help: false,
             show_youtube: None,
             show_text_dialog: false,
             text_draft: String::new(),
             image_assets: HashMap::new(),
-            gif_assets: HashMap::new(),
             image_errors: HashMap::new(),
-            video_players: HashMap::new(),
-            video_textures: HashMap::new(),
-            video_errors: HashMap::new(),
-            pending_video_seek: HashMap::new(),
             remote_jobs: Vec::new(),
             remote_pending: HashSet::new(),
             scene_generation: 1,
-            edit_video_id: None,
-            edit_view_backup: None,
             cli: CliOptions::default(),
             started_at: Instant::now(),
             update_count: 0,
@@ -2401,6 +3172,23 @@ mod tests {
             diagnostic_input_events: VecDeque::with_capacity(32),
             diagnostic_modifiers: String::new(),
             diagnostic_wants_keyboard: false,
+            actions: VecDeque::new(),
+            dialogs: DialogCoordinator::default(),
+            toast: None,
+            context_menu_pos: None,
+            hovered_header: false,
+            last_presented_position: HashMap::new(),
+            animation_paused: HashMap::new(),
+            texture_paths: HashMap::new(),
+            playback_sessions: HashMap::new(),
+            playback_textures: HashMap::new(),
+            playback_errors: HashMap::new(),
+            expected_playback_epoch: HashMap::new(),
+            presented_playback: HashMap::new(),
+            pending_seeks: HashMap::new(),
+            playback_scenario_pending: false,
+            observed_status: String::new(),
+            window_host: window_host::WindowHost::default(),
         }
     }
 
@@ -2410,7 +3198,16 @@ mod tests {
             events,
             ..Default::default()
         };
-        let _ = context.run(input, |ctx| app.draw_canvas(ctx));
+        let _ = context.run(input, |ctx| app.draw_canvas_surface(ctx));
+    }
+
+    fn selection_bar_frame(context: &EguiContext, app: &mut AnimRefApp, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = context.run(input, |ctx| app.draw_selection_bar(ctx));
     }
 
     #[test]
@@ -2448,6 +3245,118 @@ mod tests {
             Some(PathBuf::from("target/acceptance/report.json"))
         );
         assert!(options.quit_after_smoke);
+    }
+
+    #[test]
+    fn parses_minimum_diagnostic_window_size() {
+        let options = CliOptions::parse(["--window-size", "320x220"].map(std::ffi::OsString::from));
+        assert_eq!(options.window_size, Some([320.0, 220.0]));
+    }
+
+    #[test]
+    fn youtube_playback_uses_an_existing_cache_and_never_streams_the_page_url() {
+        let mut youtube = Element::new(
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw".into(),
+            "youtube",
+            0.0,
+            0.0,
+            640.0,
+            360.0,
+        );
+        assert!(cached_youtube_path(&youtube).is_none());
+        assert!(remote_playback_url(&youtube).is_none());
+
+        let directory = tempfile::tempdir().expect("create cache fixture directory");
+        let cache = directory.path().join("section.mp4");
+        fs::write(&cache, b"cached youtube section").expect("write cache fixture");
+        youtube.cached_path = Some(cache.clone());
+        assert_eq!(cached_youtube_path(&youtube), Some(cache.as_path()));
+        assert!(remote_playback_url(&youtube).is_none());
+
+        let remote_video = Element::new(
+            "https://cdn.example.test/video.mp4".into(),
+            "video",
+            0.0,
+            0.0,
+            640.0,
+            360.0,
+        );
+        assert_eq!(
+            remote_playback_url(&remote_video),
+            Some(remote_video.path.as_str())
+        );
+    }
+
+    #[test]
+    fn transport_does_not_seek_from_playback_position_rounding_without_input() {
+        let mut app = app_for_shortcut_test(PathBuf::new());
+        let video = Element::new("fixture.mp4".into(), "video", 0.0, 0.0, 320.0, 180.0);
+        let id = video.id;
+        app.scene.elements.push(video);
+        app.selected = Some(0);
+        app.presented_playback.insert(
+            id,
+            media::PlaybackSnapshot {
+                paused: false,
+                position_seconds: 0.066_666_7,
+                duration_seconds: Some(2.0),
+                frame_index: Some(1),
+                epoch: 1,
+            },
+        );
+
+        let context = EguiContext::default();
+        for _ in 0..6 {
+            selection_bar_frame(&context, &mut app, Vec::new());
+            assert!(
+                app.actions.is_empty(),
+                "playhead display rounding queued a seek"
+            );
+            assert!(
+                app.pending_seeks.is_empty(),
+                "playhead display rounding staged a seek"
+            );
+        }
+    }
+
+    #[test]
+    fn smoke_exit_timer_stays_anchored_to_the_first_report() {
+        let mut app = app_for_shortcut_test(PathBuf::new());
+        app.cli.quit_after_smoke = true;
+        app.update_count = 10;
+        app.mark_smoke_report_written();
+        assert_eq!(app.smoke_report_update, Some(10));
+        assert!(!app.smoke_exit_ready(true));
+
+        app.update_count = 12;
+        app.mark_smoke_report_written();
+        assert_eq!(app.smoke_report_update, Some(10));
+        assert!(!app.smoke_exit_ready(true));
+        assert!(!app.smoke_exit_ready(false));
+
+        app.update_count = 13;
+        app.mark_smoke_report_written();
+        assert_eq!(app.smoke_report_update, Some(10));
+        assert!(app.smoke_exit_ready(true));
+    }
+
+    #[test]
+    fn native_copy_event_routes_to_selected_item_action() {
+        let mut app = app_for_shortcut_test(PathBuf::from("target/acceptance/unused.purgif"));
+        let mut element = Element::new("clipboard text".into(), "text", 0.0, 0.0, 100.0, 30.0);
+        element.id = 41;
+        app.scene.elements.push(element);
+        app.selected = Some(0);
+        let context = EguiContext::default();
+        let _ = context.run(
+            egui::RawInput {
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ctx| app.handle_shortcuts(ctx),
+        );
+        assert!(matches!(app.actions.front(), Some(AppAction::CopySelected)));
+        assert!(context.input(|input| input.events.is_empty()));
     }
 
     #[test]
@@ -2563,6 +3472,95 @@ mod tests {
     }
 
     #[test]
+    fn canvas_primary_drag_snaps_position_on_release_in_world_coordinates() {
+        let mut app = app_for_shortcut_test(PathBuf::new());
+        app.scene.current_scale = 2.0;
+        app.scene.grid = model::GridSettings {
+            enabled: true,
+            spacing: 32.0,
+        };
+        let item = Element::new("snap me".to_owned(), "text", 50.0, 60.0, 100.0, 80.0);
+        let id = item.id;
+        app.scene.elements.push(item);
+        let context = EguiContext::default();
+        let start = Pos2::new(110.0, 120.0);
+        let end = Pos2::new(140.0, 90.0);
+        canvas_frame(&context, &mut app, Vec::new());
+        canvas_frame(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        canvas_frame(&context, &mut app, vec![egui::Event::PointerMoved(end)]);
+        canvas_frame(
+            &context,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+
+        let moved = app
+            .scene
+            .elements
+            .iter()
+            .find(|element| element.id == id)
+            .unwrap();
+        assert_eq!((moved.x, moved.y), (64.0, 32.0));
+    }
+
+    #[test]
+    fn canvas_secondary_drag_does_not_move_selected_item() {
+        let mut app = app_for_shortcut_test(PathBuf::new());
+        let item = Element::new("stay put".to_owned(), "text", 50.0, 60.0, 100.0, 80.0);
+        app.scene.elements.push(item);
+        app.selected = Some(0);
+        let context = EguiContext::default();
+        let start = Pos2::new(70.0, 80.0);
+        let end = Pos2::new(130.0, 120.0);
+        canvas_frame(&context, &mut app, Vec::new());
+        canvas_frame(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        canvas_frame(&context, &mut app, vec![egui::Event::PointerMoved(end)]);
+        canvas_frame(
+            &context,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(
+            (app.scene.elements[0].x, app.scene.elements[0].y),
+            (50.0, 60.0)
+        );
+    }
+
+    #[test]
     fn ctrl_s_event_atomically_saves_existing_scene_layout_and_text() {
         let directory = tempfile::tempdir().expect("create scene temp directory");
         let path = directory.path().join("layout.purgif");
@@ -2598,7 +3596,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let _ = context.run(input, |ctx| app.handle_shortcuts(ctx));
+        let _ = context.run(input, |ctx| {
+            app.handle_shortcuts(ctx);
+            app.run_actions(ctx);
+        });
 
         assert_eq!(app.status, format!("Saved {}", path.display()));
         let saved = Scene::from_json(&fs::read_to_string(path).expect("read saved scene"))

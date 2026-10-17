@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const CURRENT_SCENE_VERSION: u32 = 2;
+pub const CURRENT_SCENE_VERSION: u32 = 3;
 static NEXT_ELEMENT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn deserialize_null_f32_as_zero<'de, D>(deserializer: D) -> Result<f32, D::Error>
@@ -11,6 +11,13 @@ where
     D: Deserializer<'de>,
 {
     Ok(Option::<f32>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_null_f64_as_zero<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn deserialize_null_scale_as_one<'de, D>(deserializer: D) -> Result<f32, D::Error>
@@ -166,6 +173,8 @@ pub struct Element {
         skip_serializing_if = "Option::is_none"
     )]
     pub active_playback_loop_pair: Option<usize>,
+    #[serde(default, rename = "playbackState")]
+    pub playback_state: PlaybackState,
 }
 
 impl Element {
@@ -191,6 +200,7 @@ impl Element {
             source_range: None,
             playback_loop_pairs: Vec::new(),
             active_playback_loop_pair: None,
+            playback_state: PlaybackState::default(),
         }
     }
 
@@ -250,10 +260,53 @@ pub struct Scene {
     pub mode: Option<String>,
     #[serde(default, rename = "editVideo", skip_serializing_if = "Option::is_none")]
     pub edit_video: Option<Value>,
+    #[serde(default)]
+    pub grid: GridSettings,
 }
 
 fn default_scale() -> f32 {
     1.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PlaybackState {
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default, deserialize_with = "deserialize_null_f64_as_zero")]
+    pub position_seconds: f64,
+}
+
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            position_seconds: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GridSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(
+        default = "default_grid_spacing",
+        deserialize_with = "deserialize_null_f32_as_zero"
+    )]
+    pub spacing: f32,
+}
+
+fn default_grid_spacing() -> f32 {
+    32.0
+}
+
+impl Default for GridSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            spacing: default_grid_spacing(),
+        }
+    }
 }
 
 impl Default for Scene {
@@ -266,6 +319,7 @@ impl Default for Scene {
             workspace_rect: WorkspaceRect::default(),
             mode: Some("standard".into()),
             edit_video: None,
+            grid: GridSettings::default(),
         }
     }
 }
@@ -301,8 +355,17 @@ impl Scene {
         scene.format_version = Some(CURRENT_SCENE_VERSION);
         scene.mode = Some("standard".into());
         scene.edit_video = None;
+        if !scene.grid.spacing.is_finite() || scene.grid.spacing < 4.0 || scene.grid.spacing > 512.0
+        {
+            scene.grid.spacing = default_grid_spacing();
+        }
         let mut seen_ids = std::collections::HashSet::new();
         for element in &mut scene.elements {
+            if !element.playback_state.position_seconds.is_finite()
+                || element.playback_state.position_seconds < 0.0
+            {
+                element.playback_state.position_seconds = 0.0;
+            }
             if matches!(element.media_type.as_str(), "img" | "filePath")
                 && is_youtube_video_url(&element.path)
             {
@@ -386,6 +449,9 @@ mod tests {
         assert_eq!(scene.translate.x, -12.0);
         assert_eq!(scene.elements.len(), 3);
         assert_eq!(scene.elements[1].loop_pairs[0], [15.0, 42.0]);
+        assert_eq!(scene.elements[0].playback_state, PlaybackState::default());
+        assert_eq!(scene.grid, GridSettings::default());
+        assert_eq!(scene.format_version, Some(3));
         let output = scene.to_json().unwrap();
         assert!(output.contains("\"formatVersion\""));
         assert!(!output.contains("\"format_version\""));
@@ -396,12 +462,46 @@ mod tests {
     }
 
     #[test]
+    fn persists_playback_and_grid_settings_in_v3_scenes() {
+        let mut scene = Scene {
+            grid: GridSettings {
+                enabled: true,
+                spacing: 48.0,
+            },
+            ..Scene::default()
+        };
+        let mut element = Element::new("clip.gif".into(), "gif", 0.0, 0.0, 80.0, 80.0);
+        element.playback_state = PlaybackState {
+            paused: true,
+            position_seconds: 2.35,
+        };
+        scene.elements.push(element);
+
+        let json = scene.to_json().unwrap();
+        assert!(json.contains("\"formatVersion\": 3"));
+        assert!(json.contains("\"grid\""));
+        assert!(json.contains("\"playbackState\""));
+        let reread = Scene::from_json(&json).unwrap();
+        assert!(reread.grid.enabled);
+        assert_eq!(reread.grid.spacing, 48.0);
+        assert_eq!(
+            reread.elements[0].playback_state,
+            PlaybackState {
+                paused: true,
+                position_seconds: 2.35
+            }
+        );
+    }
+
+    #[test]
     fn malformed_optional_values_are_repaired() {
-        let scene = Scene::from_json(r#"{"currentScale":99,"elements":[{"type":"video","width":-2,"loopPairs":[[70,20]],"activeLoopPair":99}]}"#).unwrap();
+        let scene = Scene::from_json(r#"{"currentScale":99,"grid":{"enabled":true,"spacing":-1},"elements":[{"type":"video","width":-2,"playbackState":{"paused":true,"position_seconds":-4},"loopPairs":[[70,20]],"activeLoopPair":99}]}"#).unwrap();
         assert_eq!(scene.current_scale, 2.0);
         assert_eq!(scene.elements[0].width, None);
         assert_eq!(scene.elements[0].loop_pairs, vec![[0.0, 100.0]]);
         assert_eq!(scene.elements[0].active_loop_pair, 0);
+        assert_eq!(scene.grid.spacing, 32.0);
+        assert_eq!(scene.elements[0].playback_state.position_seconds, 0.0);
     }
 
     #[test]

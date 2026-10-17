@@ -1,0 +1,32 @@
+use std::path::PathBuf;
+
+#[derive(Debug)]
+pub enum AppAction {
+    NewScene,
+    OpenScene,
+    OpenRecent(PathBuf),
+    Save,
+    SaveAs,
+    ImportMedia,
+    ExportSelected,
+    Paste,
+    CopySelected,
+    DeleteSelected,
+    BringForward,
+    SendBackward,
+    AddText,
+    PrepareYoutube { url: String, target_id: Option<u64> },
+    ToggleGrid,
+    CenterView,
+    FitView,
+    SetLoopStart,
+    SetLoopEnd,
+    ResetLoop,
+    TogglePin,
+    Minimize,
+    ToggleMaximize,
+    Close,
+    PlayPause,
+    StepAnimation(i8),
+    SeekAnimation(f64),
+}

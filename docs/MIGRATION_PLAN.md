@@ -1,5 +1,7 @@
 # AnimRef Rust migration
 
+Historical migration plan, completed in `e5af418`. The subsequent canvas/playback revision is specified in [REVISION_PLAN.md](REVISION_PLAN.md); its removal of the separate video editor supersedes the editor requirements below.
+
 ## Responsibilities
 
 - Lead agent: source audit, architecture decision with the user, implementation guidance, independent acceptance.

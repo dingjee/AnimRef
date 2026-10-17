@@ -42,6 +42,5 @@ $docsOutput = Join-Path $output 'docs'
 New-Item -ItemType Directory -Force -Path $docsOutput | Out-Null
 Copy-Item (Join-Path $root 'docs\*') $docsOutput -Recurse -Force
 $archive = Join-Path (Split-Path -Parent $output) 'AnimRef-Windows.zip'
-if (Test-Path $archive) { Remove-Item -LiteralPath $archive -Force }
-Compress-Archive -Path (Join-Path $output '*') -DestinationPath $archive -CompressionLevel Optimal
+Compress-Archive -Path (Join-Path $output '*') -DestinationPath $archive -CompressionLevel Optimal -Force
 Write-Host "Packaged AnimRef to $output and $archive"

@@ -1,5 +1,7 @@
 # Windows Rust migration acceptance
 
+Historical record for migration commit `e5af418`. The later canvas/playback revision requires its own acceptance evidence; the executable hash, screenshots and test counts below describe that earlier release.
+
 Application accepted on 2026-10-17 against the original `59a963c` baseline. Luna implemented the migration; the lead independently reviewed the source, ran the final tests and inspected actual GPU-rendered snapshots. Package verification is recorded separately below.
 
 ## Build and tests
@@ -33,7 +35,7 @@ All six cases ran the **release executable** with `--scene`, `--screenshot`, `--
 | User's actual old scene | **Seven elements loaded: one local video and six YouTube items; 236 decoded frames, zero image/video errors**. Two previously mislabeled short links migrated to YouTube items. Uncached items wait for explicit section selection/download |
 | Invalid JSON | Error shown in a functioning window; no crash or decoder process |
 
-![Native Rust board with independent video loops, GIF, PNG and Chinese text](acceptance/native-board.png)
+![Migration-era Rust board with independent video loops, GIF, PNG and Chinese text](acceptance/migration-board.png)
 
 The user's original scene was opened read-only. Its SHA-256 remained `EBAFC97AA30FBEF68588E476F18BAB11CA22C4903D6796818A97975163D8C4FC` before and after acceptance.
 
